@@ -1,0 +1,5 @@
+
+;;; CLC v1.5 compiling SS:<VICTOR.FLAVORS>TASTY.CLISP.1
+
+(in-package (quote user::lisp)) 
+(defsymtrans psetq (form) (labels ((foo (list) (cond ((null list) nil) (t (cons (car list) (foo (cddr list)))))) (makeargs (list) (cond ((null list) nil) (t (cons (gensym) (makeargs (cdr list)))))) (zip (l1 l2) (cond ((null l1) nil) (t (cons (car l1) (cons (car l2) (zip (cdr l1) (cdr l2)))))))) (let* ((objects (foo (cdr form))) (values (foo (cddr form))) (dummys (makeargs objects))) (list* (quote funcall) (list (quote function) (list (quote lambda) dummys (cons (quote setf) (zip (mapcar (function symmac-replace) objects) dummys)))) (mapcar (function symmac-replace) values))))) 

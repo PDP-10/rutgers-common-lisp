@@ -1,0 +1,17 @@
+-*-Text-*-
+
+This was originally Spice Lisp Flavors code, now made Common
+by Torbj|rn ]hs (CONS@AIDA) and Bj|rn Victor (VICTOR@AIDA) 
+at Uppsala University, Sweden.
+
+This code seems to work, but there are certainly no guarantees that it
+will.  Please report any bugs and fixes to Bj|rn Victor.
+
+Known bugs:
+* The compiler fails to compile all files.  Two of the LAPfiles are
+  kluged (some functions aren't really LAPified).
+* The defflavor option :INITTABLE is called :INITABLE.  This is probably
+  because of the old documentation that the Spice people wrote the code
+  from.
+
+Don't panic if you find more...

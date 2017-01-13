@@ -1,0 +1,125 @@
+;;; VANILLA.SLISP
+;;;
+
+(in-package 'flavors)
+
+(defcombination-ordering daemon-ordering-primary (order)
+  (order-wrappers :base-flavor-first 'wrappers '(:wrapper :whopper))
+  (order-methods :primary 'primary '(:primary))
+  (order-methods :primary 'default '(:default))
+  (case order
+    (:base-flavor-last
+     (order-methods :base-flavor-last 'befores '(:before))
+     (order-methods :base-flavor-first 'afters '(:after)))
+    (:base-flavor-first
+     (order-methods :base-flavor-first 'befores '(:before))
+     (order-methods :base-flavor-last 'afters '(:after)))
+    (t (error "Unknown ordering ~S." order))))
+
+(defcombination-ordering daemon-ordering-list (order)
+  (order-wrappers :base-flavor-first 'wrappers '(:wrapper :whopper))
+  (case order
+    (:base-flavor-last
+     (order-methods :base-flavor-last 'primary '(:primary))
+     (order-methods :base-flavor-last 'default '(:default))
+     (order-methods :base-flavor-last 'befores '(:before))
+     (order-methods :base-flavor-first 'afters '(:after)))
+    (:base-flavor-first
+     (order-methods :base-flavor-first 'primary '(:primary))
+     (order-methods :base-flavor-first 'default '(:default))
+     (order-methods :base-flavor-first 'befores '(:before))
+     (order-methods :base-flavor-last 'afters '(:after)))
+    (t (error "Unknown ordering ~S." order))))
+
+(defcombination :daemon daemon-ordering-primary (arg)
+  (let ((primary (or (method-list 'primary) (method-list 'default))))
+    (wrapper-mix 'wrappers
+      (cond ((and (null (method-list 'befores)) (null (method-list 'afters)))
+	     (car (call-methods 'primary)))
+	    (t `(progn ,@(call-methods 'befores)
+		       (multiple-value-prog1
+			,.(or (call-methods primary) '(nil))
+			,@(call-methods 'afters))))))))
+
+(defcombination :progn daemon-ordering-list (arg)
+  (let ((primary (or (method-list 'primary) (method-list 'default))))
+    (wrapper-mix 'wrappers
+		 (cond ((and (null (method-list 'befores))
+			     (null (method-list 'afters)))
+			(car (call-methods primary)))
+		       (t `(progn ,@(call-methods 'befores)
+				  (multiple-value-prog1
+				   (progn ,@(call-methods primary))
+				   ,@(call-methods 'afters))))))))
+
+(Defflavor vanilla-flavor () ())
+
+(defmethod (vanilla-flavor print) (stream depth)
+  (send self :print-self stream depth))
+
+(Defmethod (vanilla-flavor describe) ()
+  (send self :describe))
+
+(DEfmethod (vanilla-flavor typep) (type)
+  (let ((flavor (get type 'flavor)))
+    (and flavor
+	 (not (null (member flavor
+			    (flavor-all-components
+			     (get-flavor
+			      (instance-descriptor-type
+			       (instance-descriptor self))))))))))
+
+(defmethod (vanilla-flavor :print-self) (stream depth)
+  (declare (ignore depth))
+  (format stream "#<~A ~A>"
+	  (instance-descriptor-type (instance-descriptor  self))
+	  (pointer-to-fixnum self)))
+
+(defmethod (vanilla-flavor :describe) ()
+  (let* ((name (instance-descriptor-type (instance-descriptor self)))
+	 (vec (iv-env-vector (flavor-instance-env (get-flavor name)))))
+    (format t "~&An instance of flavor ~S." name)
+    (cond ((zerop (length vec))
+	   (format t "~%No instance variables."))
+	  (t (format t "~%Instance variables:")))
+    (dotimes (i (length vec))
+      (format t "~%~3,8@T~S ~S" (aref vec i)
+	      (symeval-in-instance self (aref vec i) t :unbound)))))
+
+(defmethod (vanilla-flavor :which-operations) ()
+  (let ((list nil))
+    (do-handlers ((name function)
+		  (flavor-descriptor
+		   (get-flavor
+		    (instance-descriptor-type
+		     (instance-descriptor self)))))
+      (declare (ignore function))
+      (push name list))
+    list))
+
+(defmethod (vanilla-flavor :operation-handled-p) (operation)
+  (not (null (get-handler operation (instance-descriptor self)))))
+
+(defmethod (vanilla-flavor :send-if-handles) (operation &rest arguments)
+  (when (get-handler operation (instance-descriptor self))
+    (apply #'send self operation arguments)))
+
+;;; From here are additions by Victor
+
+(defmethod (vanilla-flavor :get-handler-for) (operation)
+  (get-handler operation (instance-descriptor self)))
+
+(defmethod (vanilla-flavor :eval-inside-yourself) (form)
+  (eval form))
+
+(defmethod (vanilla-flavor :funcall-inside-yourself) (function &rest args)
+  (funcall function args))
+
+(defmethod (vanilla-flavor :break) ()
+  (break))
+
+(defmethod (vanilla-flavor :type-of) ()
+  (instance-descriptor-type (instance-descriptor self)))
+
+(defdescribe x %instance (inst)
+  (flavors::send inst :describe))

@@ -1,0 +1,20 @@
+
+;;; CLC v1.5 compiling SS:<VICTOR.FLAVORS>KKERNEL.CLISP.1
+
+Compiling "SS:<VICTOR.FLAVORS>KKERNEL.CLISP.1".
+
+pointer-to-fixnum compiled.
+internal-make-instance compiled.
+%instance-vector compiled.
+instancep compiled.
+internal-print-instance compiled.
+alloc-instance compiled.
+%instance-ref compiled.
+instance-ref compiled.
+get-self compiled.
+instance-descriptor compiled.
+slot-unbound-p compiled.
+send compiled.
+
+Finished "SS:<VICTOR.FLAVORS>KKERNEL.CLISP.1".
+Wall time 27891 ms; Run time 7227 ms.

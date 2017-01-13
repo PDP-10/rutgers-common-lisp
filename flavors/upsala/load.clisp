@@ -1,0 +1,18 @@
+;;; -*-Mode:Clisp; Package:User;-*-
+;;; Use this to load Flavors.
+;;; All files are on Ss:<Clisp.Flavors.Upsala>.
+(in-package 'user)
+(provide "FLAVORS")
+
+(load "Ss:<Clisp.Flavors.Upsala>desc")
+(load "Ss:<Clisp.Flavors.Upsala>symmac")
+(load "Ss:<Clisp.Flavors.Upsala>kkernel")
+(load "Ss:<Clisp.Flavors.Upsala>kernel")
+(load "Ss:<Clisp.Flavors.Upsala>flavors")
+(load "Ss:<Clisp.Flavors.Upsala>setbit")
+(load "Ss:<Clisp.Flavors.Upsala>tasty")
+(load "Ss:<Clisp.Flavors.Upsala>vanilla")
+(load "Ss:<Clisp.Flavors.Upsala>p-to-fix")
+
+(use-package 'flavors)
+(make-feature 'flavors)

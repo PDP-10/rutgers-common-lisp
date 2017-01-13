@@ -1,0 +1,114 @@
+An ENVIRONMENT represents the instance variables available in an instance or
+method.  It is a defstruct (IV-ENV) with a read-only slot (VECTOR) for a vector
+of iv names; position is important.  Make-iv-env just takes this vector.
+Methods are referred to via the METHOD-FUNCTION-NAME, a symbol.  Methods get
+defined in a particular environment.  
+
+DEFUN-DEFAULT-HANDLER (fn-name args . body) (macro)
+makes a function that can be called by the send machinery.
+
+DEFINE-SET-METHOD (method-fn-name var)
+DEFINE-GET-METHOD (method-fn-name var)
+define methods that set or return the variable.
+
+INTERNAL-DEFINE-METHOD (method-fn-name env args body-list)
+defines a method.
+
+METHOD-CALL (method-fn-name . args)	(macro)
+METHOD-APPLY (method-fn-name . args)	(macro)
+used inside the body-list of a method turn the method into a "combined method".
+Magic is done in some implementations to pass the environment quickly.
+
+METHOD-CALLED-METHODS (method-fn-name)
+returns a list of the methods this method calls.  If the method was compiled,
+it will be in some order determined by the code.
+
+An INSTANCE-DESCRIPTOR represents a group of instances (e.g. a flavor) to the
+kernel.  The companion Flavors implementation treats these as objects separate
+from the flavor defstruct.  There is no notion of inheritance in the kernel;
+all inheritance is done by associating the appropriate methods with each
+inheriting instance-descriptor.
+
+MAKE-INSTANCE-DESCRIPTOR (type env default-handler &optional send-fn)
+Type is returned by type-of.  Env is the instance environment.
+Default-handler is a function defined by defun-default-handler.
+Send-fn is a function that takes arguments like (object message &rest arguments).
+
+INSTANCE-DESCRIPTOR-SEND-FN (instance-descriptor)
+INSTANCE-DESCRIPTOR-ENV (instance-descriptor)
+INSTANCE-DESCRIPTOR-TYPE (instance-descriptor)
+INSTANCE-DESCRIPTOR-DEFAULT-HANDLER (instance-descriptor)
+INSTANCE-DESCRIPTOR-INSTANTIATED-P (instance-descriptor)
+
+HANDLE-MESSAGE (message instance-descriptor method-fn-name)
+UNHANDLE-MESSAGE (message instance-descriptor)
+DO-HANDLERS
+GET-HANDLER (message instance-descriptor default)
+INSTANTIATE-INSTANCE-DESCRIPTOR (instance-descriptor)
+RESIZE-INSTANCES (instance-descriptor new-descriptor function)
+
+FREEZE-INSTANCES (instance-descriptor)
+UNFREEZE-INSTANCES (instance-descriptor)
+When a new definition for a method is loaded, all instance-descriptors
+referring to it get updated.  Instance-descriptors can be FROZEN so that they
+don't do this.
+
+
+
+PART II - IMPLEMENTATION CONSIDERATIONS
+
+Flavors is primarily a compiled, static form of object.  A kernel that does not
+use adjustable vectors for instances is a good idea here, although for
+development the flexibility could come in handy.  Each instance-descriptor has
+a hashtable that holds the method associations.
+
+A METHOD-FUNCTION is what implements a method. It gets passed the instance
+environment by SEND in the form of SELF, the mapping table, and the combined
+mapping table.  We compile them under the method-function-name so they have
+useful debugging information, but at runtime the function might be somewhere
+else.
+
+A MAPPING TABLE (perhaps better called a "permutation table") is a vector of
+numbers through which iv references for a method indirect.  One is associated
+with each method environment, instance environment pair (currently this means
+each method to instance environment).  The whole reason this is necessary is
+because methods of one flavor may refer to instance variables of another
+inherited flavor.  Simple mapping tables contain indices for %instance-ref
+and NIL to mean that the variable is not present in the instance's environment.
+
+A COMBINED mapping table is associated with each method - instance environment
+pair.  It is a vector of ENTRIES, where each entry is a (method-function, map,
+cmap) triple.  Generally only combined methods have any combined mapping table
+to speak of, hence the name.  
+
+We don't keep a list of instances, for obvious reasons involving   garbage
+collection.  Instead, when we need to resize the instances  of a class, we set
+the descriptor's dispatch-table to a cons of the new descriptor and a function
+that initializes the new unbound ivs.  Send detects this condition and
+rearranges the ivs and calls the initializing function  on the new instance.
+
+A METHOD-POINTER is an object that indirects to a method-function.  [This term
+was invented because it's not clear what type of object this should be; paging
+behavior might be best if this was a vector, like everything else.]  This
+object should also point to the structure definition for the method.  Frozen
+instance descriptors get new method-pointers consed up for their
+method-functions,  so we never remap them or redefine them.  Method-pointers
+not pointing to a method-function point to NON-METHOD, which figures out if the
+method  is undefined or needs to be mapped in.  Each time we remap, we cons 
+up a new method-pointer, in case anyone's still pointing to the old one
+[The whole point is to avoid back pointers].
+
+RANDOM COMMENTS:
+
+Note that when a method gets mapped in, everything it calls gets mapped in.
+
+If we always look at the list of called methods for the length of cmap, we could
+reuse it if it's big enough in do-map-method.
+
+Resizing could use the same storage if the new is same size orsmaller.
+Circular calling structures?
+
+Big problem: passing innermost self means we get the address wrong when printing
+the instance (or at least that it changes when an instance becomes
+non-wayward).  Oh well.
+

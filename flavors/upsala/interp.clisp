@@ -1,0 +1,22 @@
+
+(defun define-set-method (method-fn-name var)
+  "Defines a method that sets the given variable name."
+  (let ((vec (make-array 1 :initial-element var)))
+    (defun-default-handler random-setter (new)
+      (setf (%instance-ref self (svref (entry-map %entry) 0)) new))
+    (setf (symbol-function method-fn-name)
+	  (symbol-function 'random-setter))
+    (update-method method-fn-name vec nil)))
+
+(defun define-get-method (method-fn-name var)
+  "Defines a method that returns the given named variable."
+  (let ((vec (make-array 1 :initial-element var)))
+    (defun-default-handler random-getter ()
+      (%instance-ref self (svref (entry-map %entry) 0)))
+    (setf (symbol-function method-fn-name)
+	  (symbol-function 'random-getter))
+    (update-method method-fn-name vec nil)))
+
+(defun Method-find (name type structure)
+  (let ((list (get-method-types name structure)))
+    (and list (cdr (assoc type (car list))))))

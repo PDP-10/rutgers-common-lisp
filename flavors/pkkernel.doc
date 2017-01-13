@@ -1,0 +1,52 @@
+An INSTANCE is a vector-like object, perhaps of a new primitive type.  Slot
+zero should contain either an instance-descriptor or another instance this is a
+synonym for.  The other slots of the instance are used to store the state
+variables for the object, either inline for efficiency or by pointing to other
+structures.
+
+An INSTANCE-DESCRIPTOR is a vector defstruct.  It has a SENDING-FUNCTION slot,
+which should contain a function that takes arguments like (object message .
+args).  Depending upon the implementation of SEND, this may also be any of
+various distinguished values, signalling a built-in send function.  It also has
+a TYPE slot, the value of which is returned by type-of.
+
+It may be useful to be able to add state to an existing instance.  INSTANCE
+RESIZING refers to the ability to restructure an instance to reflect a new
+environment, and more specifically to the ability to conceptually grow an
+instance's vector (adjustable vectors may not be used for efficiency in the
+general case).
+
+%Alloc-instance (size id &optional (initial-element <unbound>))
+%Instance-ref (instance slot)
+  Absolute (zero is the descriptor), does not follow synonyms.
+%Instance-length (instance)
+Get-self (instance)
+  Follows the synonyms.
+Instance-ref (instance slot)
+  Uses %get-self.  Also perhaps checks for unbound ivs.
+Iv-unbound-p (instance slot)
+  Follows the synonyms.  This is primarily for initializing instances.
+send (instance operation &rest args)
+  sends a message to the instance.
+
+Ideally there is no function call between the function doing the send and the
+method invocation, but the flexibility of the sending function is there if
+needed.
+
+(typep obj 'instance) --> T, (instancep obj) --> T
+(print obj) --> (send obj 'print stream depth)
+(describe obj) --> (send obj 'describe)
+
+This much is required for a serious implementation.  Exactly what other
+features the kernel-kernel has are implementation-dependent.  The following are
+suggestions.
+
+(EVAL obj) --> (send obj 'EVAL)
+
+Maybe dumping an instance should do a (send obj 'fasd-form) and eval the result
+at loadtime to resurrect the object.  Probably (typep obj 'FROB) wants to do a
+(send obj 'typep 'FROB) so it can work like defstruct.
+
+A few systems will want to experiment with the notion of objects masquerading
+as lisp types.  This is the crux of the argument for a function that can send
+to *any* object-oriented system, so it can go into system code.

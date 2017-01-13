@@ -1,0 +1,13 @@
+;;;-*-Clisp-*-
+
+(in-package "SYSTEM")
+(require "LAP2")
+
+#_(lap #0_%cl-pointer-to-fixnum expr
+       (entry-points (2-few 1 2-many 2-many 2-many 2-many 2-many))
+       #0_()
+       (code-start)
+(label 1)    (xmovei w2 0 o1)	; Get address
+	     (icall ret1nt)	; Make a lisp number
+	     (popj p)		; Return it
+)

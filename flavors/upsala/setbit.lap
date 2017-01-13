@@ -1,0 +1,9 @@
+
+;;; CLC v1.5 compiling SS:<VICTOR.FLAVORS>SETBIT.CLISP.1
+
+(remprop (quote ldb) (quote lisp::setf-inverse)) 
+(%put (quote ldb) (quote lisp::setf-method-expander) (function (lambda (lisp::%lambda-list) (cond ((not (= (length lisp::%lambda-list) 3)) (error "Setf expander for ~S cannot be called with ~S args." (quote ldb) (1- (length lisp::%lambda-list)))) (t (let* ((bytespec (car (cdr lisp::%lambda-list))) (integer (car (cdr (cdr lisp::%lambda-list))))) (multiple-value-bind (temps vals stores store-form access-form) (get-setf-method integer) (let ((btemp (gensym)) (store (gensym)) (stemp (first stores))) (values (cons btemp temps) (cons bytespec vals) (list store) (list (quote let) (list (list stemp (list (quote dpb) store btemp access-form))) store-form store) (list (quote ldb) btemp access-form)))))))))) 
+(quote ldb) 
+(remprop (quote logbitp) (quote lisp::setf-inverse)) 
+(%put (quote logbitp) (quote lisp::setf-method-expander) (function (lambda (lisp::%lambda-list) (cond ((not (= (length lisp::%lambda-list) 3)) (error "Setf expander for ~S cannot be called with ~S args." (quote logbitp) (1- (length lisp::%lambda-list)))) (t (let* ((index (car (cdr lisp::%lambda-list))) (integer (car (cdr (cdr lisp::%lambda-list))))) (multiple-value-bind (temps vals stores store-form access-form) (get-setf-method integer) (let ((itemp (gensym)) (store (gensym)) (stemp (first stores))) (values (cons itemp temps) (cons index vals) (list store) (list (quote let) (list (list stemp (list (quote dpb) (list* (quote if) store (quote (1 0))) (list (quote byte) 1 itemp) access-form))) store-form store) (list (quote logbitp) itemp access-form)))))))))) 
+(quote logbitp) 

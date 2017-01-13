@@ -1,0 +1,32 @@
+-*- Text -*-
+This directory tree contains TOPS-20 Common Lisp.
+
+The root directory (will) contains the original distribution from
+Rutgers University. 
+
+<CLISP.UPSALA> contains the modifications and bug fixes done by
+Uppsala University.
+
+<CLISP.CARMEN> and <CLISP.AIDA> are for fixes that are only for the
+local machine.
+
+The <CLISP.OLD> branch contains the previous release, until it is
+deemed to be worthless keeping.
+
+The <CLISP.NEW> branch might contain the very latest distribution from
+Rutgers, that hasn't been rehacked by Uppsala yet.
+
+The <CLISP.FLAVORS> branch contains a Flavors implementation,
+originally for Spice Lisp by Columbia University, modified for Common
+Lisp by Uppsala University (in the .UPSALA leaf).
+
+The <CLISP.PCL> branch contains Portable CommonLoops from Xerox PARC.
+It is being hacked (and the Common Lisp is, too) to port it to
+TOPS-20 Common Lisp.
+
+<CLISP.SYS> only contains a bootstrap program, CLISP.EXE, which boots up
+some file CLISP:CLISP.EXE, and is indented to be the only directory 
+included in the system-wide SYS: logical name.
+
+
+Please contact Bjorn Victor (Victor@CARMEN) if you have any questions.

@@ -1,0 +1,11 @@
+
+;;; CLC v1.5 compiling SS:<VICTOR.FLAVORS>DESC.CLISP.4
+
+Compiling "SS:<VICTOR.FLAVORS>DESC.CLISP.4".
+
+concat-pnames compiled.
+describe compiled.
+defdescribe compiled.
+
+Finished "SS:<VICTOR.FLAVORS>DESC.CLISP.4".
+Wall time 90072 ms; Run time 5072 ms.

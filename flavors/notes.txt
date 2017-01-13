@@ -1,0 +1,36 @@
+
+The files in this directory should allow you to bring up a reasonable subset of
+Symbolics v5.0 Flavors portably.  Some amount of minor hacking will need to be
+done in order to interface your own system to instances, e.g. to make TYPE-OF
+of an instance return its flavor-name.  More complicated hacking needs to be
+done to make sending a message fast; ideally SEND is in microcode.
+
+Symbol-macros are what implement instance variables portably, by analyzing
+method code.  The portable macro (in symmac.slisp) that implements this is slow
+and probably not yet bug-free (especially since the current version is untested
+- I don't have access to a system providing environments).  However, hacking
+symbol-macros into our (Spice Lisp) interpreter and compiler was easy and even
+fun.  Of course, it helped that both were fairly simple and well-organized.
+
+The kernel is the extremely hairy part of the system.  Its basic function is to
+hide the implementation of instance variables and the various method machinery.
+Most of what might be changed for efficiency's sake has been separated into the
+kernel-kernel (pkkernel for portable).
+
+The kernel-kernel (or pkkernel, for portable) implements the instance datatype.
+All minor hooks into the system appear at this level.  The printer,
+type-system, and optionally the fasloader may be changed to know about
+instances.  The purpose of separating this out is so that other systems might
+use the same hooks.
+
+The file flavors.slisp uses the kernel and kernel-kernel.  I haven't bothered
+to "correctly" implement all the various hacks that save one microcycles, but
+if anyone wants to spend the time, I may accept the changes into future
+releases.  I'm currently working on a document that describes the differences
+between this and v5.0 Symbolics Flavors.
+
+The file Vanilla.slisp contains all the default defined combinations and the
+vanilla flavor definition.  You might want to add the "magic number" to the
+print-self routine, among other things.  Note that since this uses flavors, you
+have to (compile and) load the other files before compiling or loading this.
+

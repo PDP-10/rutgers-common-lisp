@@ -1,0 +1,36 @@
+
+;;; CLC v1.5 compiling SS:<VICTOR.FLAVORS>FROTZ.CLISP.3
+
+(in-package (quote user::flavors)) 
+
+#_(lap #0_method-find expr
+       (entry-points (2-few 2-few 2-few 1 2-many 2-many 2-many))
+       #0_NIL
+       (code-start)
+(label 1)    (adjsp q 8)
+             (movem o1 -7 q)
+             (movem o2 -6 q)
+             (movem o3 -5 q)
+             (move o3 nil)
+             (move o1 -7 q)
+             (move o2 -5 q)
+             (call flavors::%get-method-types 3)
+             (movem o1 -4 q)
+             (skipn nil -4 q)
+             (jrst 3)
+             (move o1 -4 q)
+             (move o1 0 o1)
+             (move o2 o1)
+             (move o1 -6 q)
+             (call assoc 2)
+             (move o1 1 o1)
+             (movei n 1)
+             (jrst 4)
+(label 3)    (move o1 nil)
+             (movei n 1)
+(label 4)    (adjsp q -8)
+             (popj p)
+)
+
+(%put (quote method-find) (quote lisp::%args-documentation) (quote (name type structure))) 
+(%put (quote method-find) (quote lisp::%source-documentation) (quote "SS:<VICTOR.FLAVORS>FROTZ.CLISP.3")) 

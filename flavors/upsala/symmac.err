@@ -1,0 +1,19 @@
+
+;;; CLC v1.5 compiling SS:<VICTOR.FLAVORS>SYMMAC.CLISP.1
+
+Compiling "SS:<VICTOR.FLAVORS>SYMMAC.CLISP.1".
+
+symbol-replaced-p compiled.
+symbol-replacement compiled.
+bind-symbol-macro compiled.
+bind-non-macros compiled.
+bind-non-macro compiled.
+symbol-macro-let compiled.
+symmac-replace compiled.
+replace-lambda compiled.
+defsymtrans compiled.
+symmac-leave-first-arg compiled.
+symmac-progn-like compiled.
+
+Finished "SS:<VICTOR.FLAVORS>SYMMAC.CLISP.1".
+Wall time 36867 ms; Run time 16344 ms.

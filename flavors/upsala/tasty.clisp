@@ -1,0 +1,25 @@
+;if this is winning it should be included in symmac.
+
+(in-package 'lisp)
+
+(defsymtrans psetq (form)
+  (labels ((foo (list)
+		(cond ((null list) nil)
+		      (t (cons (car list)
+			       (foo (cddr list))))))
+	   (makeargs (list)
+		     (cond ((null list) ())
+			   (t (cons (gensym)
+				    (makeargs (cdr list))))))
+	   (zip (l1 l2)
+		(cond ((null l1) nil)
+		      (t (cons (car l1)
+			       (cons (car l2)
+				     (zip (cdr l1) (cdr l2))))))))
+	  (let* ((objects (foo (cdr form)))
+		 (values (foo (cddr form)))
+		 (dummys (makeargs objects)))
+	    `(funcall #'(lambda ,dummys
+			(setf ,@(zip (mapcar #'symmac-replace objects)
+				     dummys)))
+		    ,@(mapcar #'symmac-replace values)))))

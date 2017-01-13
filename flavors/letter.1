@@ -1,0 +1,2533 @@
+Received: by kuling.UUCP; Sun, 16 Jun 85 11:34:11 -0200
+Received: by enea.UUCP; Sun, 16 Jun 85 08:17:04 -0200
+Received: by mcvax.UUCP; Sun, 16 Jun 85 06:56:52 -0200 (MET)
+Received: from CMU-CS-C.ARPA by seismo.ARPA with SMTP; Sat, 15 Jun 85 21:55:48 EDT
+Message-Id: <8506160155.AA11930@seismo.ARPA>
+Received: ID <HANDERSON@CMU-CS-C.ARPA>; Sat 15 Jun 85 21:55:22-EDT
+Date: Sat 15 Jun 85 21:55:19-EDT
+From: enea!mcvax!seismo!CMU-CS-C.ARPA!Steven.Handerson
+Subject: Flavors code
+To: enea!kuling!victor
+
+
+Bjorn,
+
+Here's what I have currently.  Let me know if you have any problems getting i
+up.
+
+-- Steve
+______________________________________________________________________
+Notes.txt
+
+The files in this directory should allow you to bring up a reasonable subset of
+Symbolics v5.0 Flavors portably.  Some amount of minor hacking will need to be
+done in order to interface your own system to instances, e.g. to make TYPE-OF
+of an instance return its flavor-name.  More complicated hacking needs to be
+done to make sending a message fast; ideally SEND is in microcode.
+
+Symbol-macros are what implement instance variables portably, by analyzing
+method code.  The portable macro (in symmac.slisp) that implements this is slow
+and probably not yet bug-free (especially since the current version is untested
+- I don't have access to a system providing environments).  However, hacking
+symbol-macros into our (Spice Lisp) interpreter and compiler was easy and even
+fun.  Of course, it helped that both were fairly simple and well-organized.
+
+The kernel is the extremely hairy part of the system.  Its basic function is to
+hide the implementation of instance variables and the various method machinery.
+Most of what might be changed for efficiency's sake has been separated into the
+kernel-kernel (pkkernel for portable).
+
+The kernel-kernel (or pkkernel, for portable) implements the instance datatype.
+All minor hooks into the system appear at this level.  The printer,
+type-system, and optionally the fasloader may be changed to know about
+instances.  The purpose of separating this out is so that other systems might
+use the same hooks.
+
+The file flavors.slisp uses the kernel and kernel-kernel.  I haven't bothered
+to "correctly" implement all the various hacks that save one microcycles, but
+if anyone wants to spend the time, I may accept the changes into future
+releases.  I'm currently working on a document that describes the differences
+between this and v5.0 Symbolics Flavors.
+
+The file Vanilla.slisp contains all the default defined combinations and the
+vanilla flavor definition.  You might want to add the "magic number" to the
+print-self routine, among other things.  Note that since this uses flavors, you
+have to (compile and) load the other files before compiling or loading this.
+
+______________________________________________________________________
+symmac.slisp
+
+;;; -*- Mode: Lisp; Package: lisp -*-
+;;;
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Symbol macros are used to implement instance variables.
+;;; Written by Steven Handerson.
+
+(in-package 'lisp)
+(export 'symbol-macro-let)
+
+;;; Symbol macros are akin to labels or macrolet; the code for a replacement is 
+;;; in the same environment that the original symbol was in (including the symbol
+;;; macros).  This is mostly because it's easier to implement.
+;;;
+;;; Newer version to deal with environments correctly.
+;;; Since there's no way to tell a macro with &environment in its arglist
+;;; from other macros, we must always maintain the lisp system's view of 
+;;; the environment.  We can do this in a clumsy way by having the
+;;; symbol-macro-let macro return somthing containing an internal macro
+;;; that gets the environment where it appears and then deals with its body
+;;; using that information.
+;;;
+
+(defvar *symbol-macro-environment* nil
+  "Used to pass the expansion environment to the transforms.")
+
+(defvar *symbol-macro-replacements* nil
+  "Holds symbol-macro-let replacements during macroexpansion.")
+
+(proclaim '(inline symbol-replaced-p))
+(Defun  symbol-replaced-p (symbol)
+  (assoc symbol *symbol-macro-replacements*))
+
+(proclaim '(inline symbol-replacement))
+(Defun symbol-replacement (replaced-p)
+  (cdr replaced-p))
+
+
+;;; Binding functions.
+
+(defun bind-symbol-macro (symbol expansion)
+  (push (cons symbol expansion) *symbol-macro-replacements*))
+
+(defmacro bind-non-macros (list &body forms)
+  `(let ((*symbol-macro-replacements*
+	  (remove-if #'(lambda (x) (member x ,list))
+		     *symbol-macro-replacements*
+		     :key #'car)))
+     ,@forms))
+
+(defmacro bind-non-macro (var &body forms)
+  `(let ((*symbol-macro-replacements*
+	  (remove ,var *symbol-macro-replacements* :key #'car)))
+     ,@forms))
+
+
+;;;
+;;; The macro itself.
+;;;
+
+(defmacro symbol-macro-let (bindings &body body
+				     &environment *symbol-macro-environment*)
+  (let ((*symbol-macro-replacements* *symbol-macro-replacements*))
+    (dolist (binding bindings)
+      (bind-symbol-macro (car binding) (cadr binding)))
+    `(progn ,@(mapcar #'symmac-replace body))))
+
+
+;;; 
+;;; Replacement functions.
+;;;
+
+;;; Macros and "symbol macros" get expanded, and the cycle repeats.
+;;; Normal functions just get their arguments replaced on.
+;;; Lambda calls get their bodies replaced as well as their args.
+;;; Special forms have their own random ways of getting replaced on,
+;;;  stored on their 'sym-mac-transform property.
+;;;
+
+(defun symmac-replace (form)
+  (prog (temp)
+    loop
+    (cond ((and (symbolp form)
+		(setq temp (symbol-replaced-p form)))
+	   (setq form (symbol-replacement temp))
+	   (go loop))
+	  ((atom form) (return form))
+	  ((not (symbolp (car form)))
+	   (let ((lambda (car form))
+		 (args (cdr form)))
+	     (or (and (listp lambda) (eq (car lambda) 'lambda))
+	       (error "Illegal function object: ~A" lambda))
+	     (return `((lambda ,@(replace-lambda (cadr lambda) (cddr lambda)))
+		       ,@(mapcar #'symmac-replace args)))))
+	  ((setq temp (get (car form) 'sym-mac-transform))
+	   (return (funcall temp form)))
+	  ((progn (multiple-value-setq (form temp)
+		    (macroexpand form *symbol-macro-environment))
+		  temp)
+	   (go loop))
+	  ((special-form-p (car form))
+	   (error "Symbol-macro-let internal error: untransformed special~
+		  form ~A." (car form)))
+	  (t (return (cons (car form)
+			   (mapcar #'(lambda (form) (symmac-replace form))
+				   (cdr form))))))))
+
+
+;;; Takes a lambda-list and a list of forms to replace in that environment.
+;;; Returns a list of the new arglist and forms.
+
+(Defun replace-lambda (lambda-list forms)
+  (macrolet ((symmac-lambda-bind-var
+	      (var) `(setq *symbol-macro-replacements*
+			   (delete ,var *symbol-macro-replacements*
+				   :key #'car))))
+    (do* ((*symbol-macro-replacements* (copy-list *symbol-macro-replacements*))
+	  (list lambda-list (Cdr list))
+	  (search '(&optional &rest &key &allow-other-keys &aux))
+	  (temp nil)
+	  (newlist nil))
+	 ((endp list)
+	  (cons (nreverse newlist) (mapcar #'symmac-replace forms)))
+      (let ((car (car list)))
+	(cond ((setq temp (member car search))
+	       (setq search (cdr temp))
+	       (push car newlist))
+	      (t (case (car search)
+		   ;; This is for the normal vars.
+		   (&optional (symmac-lambda-bind-var car)
+			      (push car newlist))
+		   ;; This next clause is for the optionals.  Etc.
+		   (&rest (cond ((symbolp car)
+				 (symmac-lambda-bind-var car)
+				 (push car newlist))
+				(T (cond ((null (cdr car))
+					  (push car newlist))
+					 (t (push `(,(car car)
+						    ,(symmac-replace
+						      (cadr car))
+						    ,@(cddr car))
+						  newlist)
+					    (if (not (null (cddr car)))
+						(symmac-lambda-bind-var
+						 (caddr car)))))
+				   (symmac-lambda-bind-var (car car))))) 
+		   (&key (symmac-lambda-bind-var car)
+			 (push car newlist))
+		   (&allow-other-keys
+		    (cond ((symbolp car)
+			   (symmac-lambda-bind-var car)
+			   (push car newlist))
+			  (t (if (not (null (nth 1 car)))
+				 (push `(,(Car car)
+					 ,(symmac-replace (cadr car))
+					 ,(caddr car))
+				       newlist)
+				 (push car newlist))
+			     (if (not (null (nth 2 car)))
+				 (symmac-lambda-bind-var (nth 2 car)))
+			     (if (listp (car car))
+				 (symmac-lambda-bind-var (cadar car))))))
+		   (&aux (error "~A in lambda-list after &allow-other-keys."
+				car))
+		   (nil (cond ((symbolp car)
+			       (symmac-lambda-bind-var car)
+			       (push car newlist))
+			      (t (push `(,(car car)
+					 ,(symmac-replace (cadr car)))
+				       newlist)
+				 (symmac-lambda-bind-var (Car car)))))
+		   )))))))
+
+
+
+;;;
+;;; The transforms.
+;;;
+
+;;; Can take a raw function, which gets applied to the form to be transformed.
+;;; If it changes the environment, it should bind *symbol-macro-replacements*.
+
+(defmacro defsymtrans (special-form args-or-function &body body)
+  `(setf (get ',special-form 'sym-mac-transform)
+	 ,(if body
+	      `#'(lambda ,args-or-function
+		   (let ((*symbol-macro-replacements*
+			  *symbol-macro-replacements*))
+		     ,@body))
+	      args-or-function)))
+
+(defun symmac-leave-first-arg (Form)
+  (list* (car form) (cadr form)
+	 (mapcar #'symmac-replace (cddr form))))
+
+(defun symmac-progn-like (form)
+  (cons (car form) (mapcar #'symmac-replace (cdr form))))
+
+(defsymtrans quote #'identity)
+(defsymtrans go #'identity)
+(defsymtrans declare #'identity)
+
+(defsymtrans eval-when #'symmac-leave-first-arg)
+(defsymtrans block #'symmac-leave-first-arg)
+(defsymtrans return-from #'symmac-leave-first-arg)
+(defsymtrans the #'symmac-leave-first-arg)
+(defsymtrans %primitive #'symmac-leave-first-arg)
+
+(Defsymtrans return #'symmac-progn-like)
+(defsymtrans and #'symmac-progn-like)
+(defsymtrans or #'symmac-progn-like)
+(defsymtrans multiple-value-call #'symmac-progn-like)
+(defsymtrans multiple-value-prog1 #'symmac-progn-like)
+(defsymtrans unwind-protect #'symmac-progn-like)
+(defsymtrans progn #'symmac-progn-like)
+(defsymtrans prog1 #'symmac-progn-like)
+(DEfsymtrans prog2 #'symmac-progn-like)
+(defsymtrans if #'symmac-progn-like)
+(defsymtrans progv #'symmac-progn-like)
+(defsymtrans catch #'symmac-progn-like)
+(defsymtrans throw #'symmac-progn-like)
+
+
+(defsymtrans function (form)
+  (let ((lambdap (cadr form)))
+    (cond ((symbolp lambdap) form)
+	  ((atom lambdap) (error "Illegal arg to FUNCTION - ~A." lambdap))
+	  ((eq 'lambda (car lambdap))
+	   `#'(lambda ,@(replace-lambda (cadr lambdap) (cddr lambdap))))
+	  (t (error "Symmac - strange thing in FUNCTION.")))))
+
+(defsymtrans tagbody (form)
+  (do ((forms (cdr form) (cdr forms))
+       (newforms nil))
+      ((null forms) (cons 'tagbody (nreverse newforms)))
+    (if (symbolp (Car forms))
+	(push (car forms) newforms)
+	(push (symmac-replace (car forms)) newforms))))
+
+(defsymtrans setq (form)
+  (cons 'setf (mapcar #'symmac-replace (cdr form))))
+
+(defsymtrans let (form)
+  (let ((bound nil))
+    `(let ,(mapcar
+	    #'(lambda (binding)
+		(cond ((atom binding)
+		       (push binding bound)
+		       binding)
+		      (t (push (car binding) bound)
+			 `(,(car binding) ,(symmac-replace (Cadr binding))))))
+	    (cadr form))
+       ,@(bind-non-macros bound
+			  (mapcar #'symmac-replace (cddr form))))))
+
+
+(defsymtrans prog (Form)
+  `(let ,(cadr form)
+     (prog nil
+       ,@(mapcar #'(lambda (f) (if (symbolp f) f (symmac-replace f)))
+		 (cddr form)))))
+
+
+(defsymtrans prog* (Form)
+  `(let* ,(cadr form)
+     (prog* ()
+       ,@(mapcar #'(lambda (f) (if (symbolp f) f (symmac-replace f)))
+		 (cddr form)))))
+
+(defsymtrans let* (form)
+  `(let* ,(mapcar
+	   #'(lambda (binding)
+	       (cond ((atom binding)
+		      (setq *symbol-macro-replacements*
+			    (delete binding *symbol-macro-replacements*
+				    :key #'car))
+		      binding)
+		     (t (prog1 `(,(car binding) ,(symmac-replace (cadr binding)))
+			       (setq *symbol-macro-replacements*
+				     (delete (Car binding)
+					     *symbol-macro-replacements*
+					     :key #'car))))))
+	   (cadr form))
+     ,@(mapcar #'symmac-replace (cddr form))))
+
+(defsymtrans cond (form)
+  `(cond ,@(mapcar #'(lambda (clause)
+		       (mapcar #'symmac-replace clause))
+		   (cdr form))))
+
+(defsymtrans defun (form)
+  (let ((name (cadr form))
+	(args (caddr form))
+	(body (cdddr form)))
+    `(defun ,name ,@(replace-lambda args body))))
+
+(defsymtrans multiple-value-bind (form)
+  (let ((bindings (cadr form))
+	(values (caddr form))
+	(forms (cdddr form)))
+    `(multiple-value-bind ,bindings ,(symmac-replace values)
+       ,@(bind-non-macros bindings
+			  (mapcar #'symmac-replace forms)))))
+
+(defsymtrans multiple-value-setq (form)
+  (pop form)
+  (let* ((vars (pop form))
+	 (values (pop form))
+	 (pairs nil)
+	 (gens (mapcar #'(lambda (var)
+			   (let ((gen (gensym)))
+			     (push gen pairs)
+			     (push var pairs)
+			     gen))
+		       vars)))
+    `(multiple-value-bind ,gens ,(symmac-replace values)
+       ,(symmac-replace `(setf ,@pairs)))))
+
+
+(defsymtrans compiler-let (form)
+  `(compiler-let ,(cadr form)
+     (symmac-internal ,*symbol-macro--replacements* ,@(cddr form))))
+
+(defsymtrans flet (form)
+  `(flet ,(cadr form)
+     (symmac-internal ,*symmac-replacements* ,@(cddr form))))
+
+(defsymtrans macrolet (form)
+  `(macrolet ,(cadr form)
+     (symmac-internal ,*symmac-replacements* ,@(cddr form))))
+
+;;; This is complicated, but I think it works.  A labels gets expanded into
+;;; a labels inside a duplicate labels.  The first is just to shadow
+;;; any macros for the benefit of constructing the environment.  The inner
+;;; is the one that's functional, whose label bodies must be replaced for
+;;; symbol macros.
+
+(defsymtrans labels (form)
+  `(labels ,(cadr form)
+     (symmac-internal ,*symbol-macro-replacements*
+		      (symmac-labels ,@(cdr form)))))
+
+(defsymtrans symmac-labels (form)
+  `(labels ,(mapcar #'(lambda (binding)
+			`(,(car binding)
+			  ,@(replace-lambda (cadr binding) (cddr binding))))
+		    (cadr form))
+     ,@(mapcar #'symmac-replace (cddr form))))
+______________________________________________________________________
+pkkernel.doc
+
+An INSTANCE is a vector-like object, perhaps of a new primitive type.  Slot
+zero should contain either an instance-descriptor or another instance this is a
+synonym for.  The other slots of the instance are used to store the state
+variables for the object, either inline for efficiency or by pointing to other
+structures.
+
+An INSTANCE-DESCRIPTOR is a vector defstruct.  It has a SENDING-FUNCTION slot,
+which should contain a function that takes arguments like (object message .
+args).  Depending upon the implementation of SEND, this may also be any of
+various distinguished values, signalling a built-in send function.  It also has
+a TYPE slot, the value of which is returned by type-of.
+
+It may be useful to be able to add state to an existing instance.  INSTANCE
+RESIZING refers to the ability to restructure an instance to reflect a new
+environment, and more specifically to the ability to conceptually grow an
+instance's vector (adjustable vectors may not be used for efficiency in the
+general case).
+
+%Alloc-instance (size id &optional (initial-element <unbound>))
+%Instance-ref (instance slot)
+  Absolute (zero is the descriptor), does not follow synonyms.
+%Instance-length (instance)
+Get-self (instance)
+  Follows the synonyms.
+Instance-ref (instance slot)
+  Uses %get-self.  Also perhaps checks for unbound ivs.
+Iv-unbound-p (instance slot)
+  Follows the synonyms.  This is primarily for initializing instances.
+send (instance operation &rest args)
+  sends a message to the instance.
+
+Ideally there is no function call between the function doing the send and the
+method invocation, but the flexibility of the sending function is there if
+needed.
+
+(typep obj 'instance) --> T, (instancep obj) --> T
+(print obj) --> (send obj 'print stream depth)
+(describe obj) --> (send obj 'describe)
+
+This much is required for a serious implementation.  Exactly what other
+features the kernel-kernel has are implementation-dependent.  The following are
+suggestions.
+
+(EVAL obj) --> (send obj 'EVAL)
+
+Maybe dumping an instance should do a (send obj 'fasd-form) and eval the result
+at loadtime to resurrect the object.  Probably (typep obj 'FROB) wants to do a
+(send obj 'typep 'FROB) so it can work like defstruct.
+
+A few systems will want to experiment with the notion of objects masquerading
+as lisp types.  This is the crux of the argument for a function that can send
+to *any* object-oriented system, so it can go into system code.
+______________________________________________________________________
+pkkernel.slisp
+
+;;; -*- Mode: lisp; Package: system -*-
+;;;
+;;; The kernel-kernel allows object-oriented systems to share hooks.
+;;; Written by Steven Handerson.
+;;;
+
+(in-package "SYSTEM")
+
+(export '(send alloc-instance get-self %instance-ref instance-ref iv-unbound-p))
+
+(eval-when (compile eval load)
+  (defstruct (instance (:print-function internal-print-instance)
+		       (:constructor internal-make-instance (descriptor vector))
+		       (:predicate instancep))
+  descriptor
+  vector)
+
+  (defun internal-print-instance (instance stream depth)
+    (cond ((get-handler :print-self instance)
+	   (send instance :print-self stream depth))
+	  (t (format stream "#<Random Instance ~S>"
+		     (%primitive make-immediate-type instance 16)))))
+
+  (defmacro alloc-instance (size id (initial-element 'unbound))
+    "(size instance-descriptor [initial-element])
+    Allocates a new instance thingy."
+    `(internal-make-instance
+      ,id (make-array ,size :initial-element ,initial-element)))
+
+  (defmacro %instance-ref (instance slot)
+    "Doesn't follow 'forwarding pointers'."
+    `(aref (%instance-vector ,instance) ,slot))
+
+  (defmacro instance-ref (instance slot)
+    "Follows 'forwarding pointers'."
+    `(aref (%instance-vector (get-self ,instance)) (1+ ,slot))))
+
+
+
+
+
+(eval-when (compile eval load)
+
+  (defmacro get-self (instance)
+    "(instance)
+    Follows 'forwarding pointers' to get the REAL instance."
+    `(let* ((self ,instance))
+       (loop (let ((new (%instance-ref self 0)))
+	       (if (instancep new) (setq self new)
+		   (return self))))))
+  
+  (defmacro instance-descriptor (instance)
+    "(instance)
+    Follows 'forwarding pointers'."
+    `(%instance-ref (get-self ,instance) 0))
+
+  (defmacro iv-unbound-p (instance slot)
+    "(instance slot)
+    Follows 'forwarding pointers'."
+    `(let ((thing (instance-ref ,instance ,slot)))
+       (eq 'unbound thing))))
+
+(proclaim '(inline send))
+(defun send (instance message &rest args)
+  (let* ((self (get-self instance))
+	 (id (%instance-ref self 0))
+	 (send-fn (aref id 0)))
+    (apply send-fn instance message args)))
+______________________________________________________________________
+kernel.doc
+
+An ENVIRONMENT represents the instance variables available in an instance or
+method.  It is a defstruct (IV-ENV) with a read-only slot (VECTOR) for a vector
+of iv names; position is important.  Make-iv-env just takes this vector.
+Methods are referred to via the METHOD-FUNCTION-NAME, a symbol.  Methods get
+defined in a particular environment.  
+
+DEFUN-DEFAULT-HANDLER (fn-name args . body) (macro)
+makes a function that can be called by the send machinery.
+
+DEFINE-SET-METHOD (method-fn-name var)
+DEFINE-GET-METHOD (method-fn-name var)
+define methods that set or return the variable.
+
+INTERNAL-DEFINE-METHOD (method-fn-name env args body-list)
+defines a method.
+
+METHOD-CALL (method-fn-name . args)	(macro)
+METHOD-APPLY (method-fn-name . args)	(macro)
+used inside the body-list of a method turn the method into a "combined method".
+Magic is done in some implementations to pass the environment quickly.
+
+METHOD-CALLED-METHODS (method-fn-name)
+returns a list of the methods this method calls.  If the method was compiled,
+it will be in some order determined by the code.
+
+An INSTANCE-DESCRIPTOR represents a group of instances (e.g. a flavor) to the
+kernel.  The companion Flavors implementation treats these as objects separate
+from the flavor defstruct.  There is no notion of inheritance in the kernel;
+all inheritance is done by associating the appropriate methods with each
+inheriting instance-descriptor.
+
+MAKE-INSTANCE-DESCRIPTOR (type env default-handler &optional send-fn)
+Type is returned by type-of.  Env is the instance environment.
+Default-handler is a function defined by defun-default-handler.
+Send-fn is a function that takes arguments like (object message &rest arguments).
+
+INSTANCE-DESCRIPTOR-SEND-FN (instance-descriptor)
+INSTANCE-DESCRIPTOR-ENV (instance-descriptor)
+INSTANCE-DESCRIPTOR-TYPE (instance-descriptor)
+INSTANCE-DESCRIPTOR-DEFAULT-HANDLER (instance-descriptor)
+INSTANCE-DESCRIPTOR-INSTANTIATED-P (instance-descriptor)
+
+HANDLE-MESSAGE (message instance-descriptor method-fn-name)
+UNHANDLE-MESSAGE (message instance-descriptor)
+DO-HANDLERS
+GET-HANDLER (message instance-descriptor default)
+INSTANTIATE-INSTANCE-DESCRIPTOR (instance-descriptor)
+RESIZE-INSTANCES (instance-descriptor new-descriptor function)
+
+FREEZE-INSTANCES (instance-descriptor)
+UNFREEZE-INSTANCES (instance-descriptor)
+When a new definition for a method is loaded, all instance-descriptors
+referring to it get updated.  Instance-descriptors can be FROZEN so that they
+don't do this.
+
+
+
+PART II - IMPLEMENTATION CONSIDERATIONS
+
+Flavors is primarily a compiled, static form of object.  A kernel that does not
+use adjustable vectors for instances is a good idea here, although for
+development the flexibility could come in handy.  Each instance-descriptor has
+a hashtable that holds the method associations.
+
+A METHOD-FUNCTION is what implements a method. It gets passed the instance
+environment by SEND in the form of SELF, the mapping table, and the combined
+mapping table.  We compile them under the method-function-name so they have
+useful debugging information, but at runtime the function might be somewhere
+else.
+
+A MAPPING TABLE (perhaps better called a "permutation table") is a vector of
+numbers through which iv references for a method indirect.  One is associated
+with each method environment, instance environment pair (currently this means
+each method to instance environment).  The whole reason this is necessary is
+because methods of one flavor may refer to instance variables of another
+inherited flavor.  Simple mapping tables contain indices for %instance-ref
+and NIL to mean that the variable is not present in the instance's environment.
+
+A COMBINED mapping table is associated with each method - instance environment
+pair.  It is a vector of ENTRIES, where each entry is a (method-function, map,
+cmap) triple.  Generally only combined methods have any combined mapping table
+to speak of, hence the name.  
+
+We don't keep a list of instances, for obvious reasons involving   garbage
+collection.  Instead, when we need to resize the instances  of a class, we set
+the descriptor's dispatch-table to a cons of the new descriptor and a function
+that initializes the new unbound ivs.  Send detects this condition and
+rearranges the ivs and calls the initializing function  on the new instance.
+
+A METHOD-POINTER is an object that indirects to a method-function.  [This term
+was invented because it's not clear what type of object this should be; paging
+behavior might be best if this was a vector, like everything else.]  This
+object should also point to the structure definition for the method.  Frozen
+instance descriptors get new method-pointers consed up for their
+method-functions,  so we never remap them or redefine them.  Method-pointers
+not pointing to a method-function point to NON-METHOD, which figures out if the
+method  is undefined or needs to be mapped in.  Each time we remap, we cons 
+up a new method-pointer, in case anyone's still pointing to the old one
+[The whole point is to avoid back pointers].
+
+RANDOM COMMENTS:
+
+Note that when a method gets mapped in, everything it calls gets mapped in.
+
+If we always look at the list of called methods for the length of cmap, we could
+reuse it if it's big enough in do-map-method.
+
+Resizing could use the same storage if the new is same size orsmaller.
+Circular calling structures?
+
+Big problem: passing innermost self means we get the address wrong when printing
+the instance (or at least that it changes when an instance becomes
+non-wayward).  Oh well.
+
+______________________________________________________________________
+kernel.slisp
+
+;;; -*- Mode: lisp; Package: flavor-internals; log: kernel.log -*-
+;;;
+;;; The Flavors kernel hides the implementation of instance variables.
+;;;
+;;; Written by Steven Handerson as part of the Spice Project.
+;;; All Spice Lisp code is in the public domain.
+;;; Contact Scott Fahlman for details.
+;;;
+;;; Change: remap by name of the message.
+;;; Microcode should pass all values inline.
+;;; Someday: make rehash better (make id's internal hashtables).
+;;; Keep entry vectors, I guess.  Pass things as args and pass the 
+;;; vector too, and decache if it changes.
+;;; Make cyclical hastables of 1 thing for microcode.
+;;;
+;;; What if you do a set-handler and a submethod isn't defined?
+
+(in-package "FLAVOR-INTERNALS" :use '("LISP" "SYSTEM") :nicknames '("FI"))
+
+#+perq
+(shadow '(get-handler))
+
+(export '(iv-env
+	  make-iv-env
+	  iv-env-vector
+
+	  make-instance-descriptor
+	  instance-descriptor-env
+	  instance-descriptor-type
+	  instance-descriptor-default-handler
+	  instance-descriptor-instantiated-p
+	  handle-message
+	  unhandle-message
+	  do-handlers
+	  get-handler
+	  get-message
+	  instantiate-instance-descriptor
+	  resize-instances 
+	  freeze-instances
+	  unfreeze-instances
+
+	  defun-default-handler
+	  internal-define-method
+	  method-apply
+	  method-call
+	  define-set-method
+	  define-get-method
+	  method-defined-p
+	  method-called-methods
+
+	  send
+	  alloc-instance
+	  get-self
+	  %instance-ref
+	  instance-ref
+	  iv-unbound-p
+	  self
+	  instance-descriptor
+	  do-instance-resizing
+	  ))
+
+
+
+;;;
+;;; Random stuff and Environments.
+;;;
+
+
+;;; Takes a list of forms and returns values of a list of doc-strings
+;;; and declares, and a list of the remaining forms.
+
+(eval-when (compile eval load)
+  (defun extract-doc-and-declares (forms)
+    (do ((forms forms (cdr forms))
+	 (docs nil (cons (car forms) docs)))
+	((or (endp forms)
+	     (and (not (stringp (car forms)))
+		  (not (and (listp (car forms))
+			    (eq (caar forms) 'declare)))))
+	 (values (nreverse docs) forms))))
+
+  (defmacro self-and-descriptor (instance)
+    `(let ((inst (get-self ,instance)))
+       (values inst (%instance-ref inst 0))))
+
+  (Defmacro pointer-to-fixnum (object)
+    `(%primitive make-immediate-type ,object 16)))
+(defun private-structure-printer (object stream depth)
+  (Declare (ignore depth))
+  (format stream "#<~A ~A>" (type-of object) (pointer-to-fixnum object)))
+
+;;;
+;;; Environments.
+;;;
+
+;;; If method defining forms can ever be nested, then an environment
+;;; should contain symbols for the self and other mapping tables
+;;; so that all ivs are lexically apparent (rather than one mapping-table
+;;; binding breaking the other set of ivs).
+
+(Defstruct (iv-env (:print-function private-structure-printer))
+  (vector nil :read-only t)
+  (bindings* t))
+
+(defun iv-env-bindings (env)
+  (let ((bin (iv-env-bindings* env)))
+    (cond ((listp bin) bin)
+	  (t (setf (iv-env-bindings* env)
+		   (let ((vec (iv-env-vector env))
+			 (res nil))
+		     (dotimes (i (length vec))
+		       (push `(,(Aref vec i) (iv ,(aref vec i))) res))
+		     res))))))
+
+;;;
+;;; Defstructs
+;;;
+
+(Defstruct (instance-descriptor (:type vector)
+				(:constructor internal-make-id
+					      (type env default-entry)))
+  (send-fn 'flavor-send)
+  type
+  (table (make-hash-table :size 30 :test #'eq))
+  default-entry
+  (instantiated-p nil)
+  (env nil :read-only t))
+
+(defun make-instance-descriptor (type env default-handler)
+  (internal-make-id type env (make-entry :function default-handler)))
+
+(Defstruct (entry (:type vector))
+  function
+  map
+  cmap)
+
+
+(Defstruct (method (:print-function private-structure-printer)
+		   (:predicate methodp)
+		   (:constructor make-method (fn-name calls ivs current-symbol)))
+  fn-name
+  calls          ; List in reverse order.
+  ivs            ; Vector of variable names or NIL.
+  current-symbol)
+
+(defun method-called-methods (method)
+  (method-calls (symbol-value method)))
+
+(defun method-defined-p (method-fn-name)
+  (methodp (symbol-value method-fn-name)))
+
+;;;
+;;; Instance Descriptors.
+;;;
+
+(defmacro funcall-entry (self message entry &rest args)
+  `(funcall (entry-function ,entry) ,self ,message ,entry ,@args))
+
+(defmacro apply-entry (self message entry &rest args)
+  `(apply (entry-function ,entry) ,self ,message ,entry ,@args))
+
+(eval-when (compile eval load)
+  (defmacro get-message ()
+    "()
+    Used in the body of a default handler, returns the message
+    that invoked this handler."
+    '%message)
+  (defsetf get-message () (new)
+    (declare (ignore new))
+    (error "Cannot setf get-message.")))
+
+(eval-when (compile eval load)
+  (Defmacro defun-default-handler (name Args &body body)
+    "(name args . body)
+    Twiddles args so the function can be called as a default handler.
+    Also makes (get-message) work in the body."
+    (multiple-value-bind (docs forms) (extract-doc-and-declares body)
+      `(defun ,name (self %message %entry ,@args)
+	 ,@docs
+	 self %message %entry
+	 (progn ,@forms)))))
+
+(defun flavor-send (instance message &rest args)
+  (multiple-value-bind (self id) (self-and-descriptor instance)
+    (let* ((table (instance-descriptor-table id)))
+      (unless (hash-table-p table)
+	(do-instance-resizing instance)
+	(multiple-value-setq (self id) (self-and-descriptor instance))
+	(setq table (instance-descriptor-table id))
+	(unless (hash-table-p table)
+	  (error "Internal error: resizing #<Random Instance ~S> didn't work."
+		 (pointer-to-fixnum instance))))
+      (let ((entry (gethash
+		    message table
+		    (instance-descriptor-default-entry id))))
+	(apply-entry self message entry args)))))
+
+
+(defun handle-message (message instance-descriptor method)
+  "The method must be defined before it can be a handler.
+  (via internal-define-method or define-set-method or define-get-method)."
+  (let ((table (instance-descriptor-table instance-descriptor)))
+    (unless (null table)
+      (let ((entry (make-entry :function method)))
+	(do-map-method instance-descriptor entry)
+	(setf (gethash message (instance-descriptor-table instance-descriptor))
+	      entry))))
+  method)
+
+(Defun unhandle-message (message instance-descriptor)
+  "Makes the given message unhandled."
+  (let ((table (instance-descriptor-table instance-descriptor)))
+    (unless (null table)
+      (remhash message table))))
+
+(defun get-handler (message inst-or-desc)
+  "Returns the method-function-name of the method that handles message
+  for instance or instance-descriptor inst-or-desc."
+  (let (table)
+    (cond
+     ((instancep inst-or-desc)
+      (multiple-value-bind (self id) (self-and-descriptor inst-or-desc)
+	(setq table (instance-descriptor-table id))
+	(unless (hash-table-p table)
+	  (do-instance-resizing self)
+	  (multiple-value-setq (self id) (self-and-descriptor self))
+	  (setq table (instance-descriptor-table id))
+	  (unless (hash-table-p table)
+	    (error "Internal error: resizing #<Random Instance ~S> didn't work."
+		   (pointer-to-fixnum inst-or-desc))))))
+     (t (setq table (instance-descriptor-table inst-or-desc))))
+    (let ((entry (gethash message table)))
+      (if entry (method-fn-name (symbol-value (entry-function entry)))))))
+
+
+;;;
+;;; Other instance-descriptor stuff.
+;;;
+
+
+(defmacro do-handlers (((name function) instance-descriptor) &body body)
+  "(((message method-fn-name) instance-descriptor) . body)
+  Does the body for each handler, with message and method-fn-name bound to
+  each successive handler binding."
+  `(block nil
+     (let ((table (instance-descriptor-table ,instance-descriptor)))
+       (unless (null table)
+	 (maphash #'(lambda (,name entry)
+		      (let ((,function
+			     (method-fn-name
+			      (symbol-value (entry-function entry)))))
+			,@body))
+		  table)))))
+
+(defun instantiate-instance-descriptor (instance-descriptor)
+  "Returns the new instance, all ivs set to unbound."
+  (let* ((len (length (iv-env-vector
+		       (instance-descriptor-env instance-descriptor))))
+	 (new (alloc-instance len instance-descriptor)))
+    (setf (instance-descriptor-instantiated-p instance-descriptor) t)
+    new))
+
+(defun resize-instances (instance-descriptor new-descriptor function)
+  "Basically just changes the instance to be of a new instance-descriptor.
+  Those slots not present in the previous descriptor get set to unbound.
+  The function, which probably doesn't get called immediately, should
+  (when it IS called) try to set the unbound variables to some reasonable
+  value."
+  (setf (instance-descriptor-instantiated-p new-descriptor)
+	(instance-descriptor-instantiated-p instance-descriptor)
+	(instance-descriptor-table instance-descriptor)
+	(cons new-descriptor function)))
+
+(defun do-instance-resizing (instance)
+  (multiple-value-bind (inner id) (self-and-descriptor instance)
+    (let* ((new-id (car (instance-descriptor-table id)))
+	   (fn (cdr (instance-descriptor-table id)))
+	   (old-env (instance-descriptor-env id))
+	   (new-env (instance-descriptor-env new-id))
+	   (old-vec (iv-env-vector old-env))
+	   (new-vec (iv-env-vector new-env)))
+      (let ((new (alloc-instance (length new-vec)
+				 new-id (lisp::%sp-make-misc 0))))
+	(dotimes (i (length new-vec))
+	  (let* ((iv (aref new-vec i))
+		 (old-pos (position iv old-vec)))
+	    (if old-pos
+		(setf (%instance-ref new (1+ i))
+		      (%instance-ref inner (1+ old-pos))))))
+	(setf (%instance-ref instance 0) new)
+	(funcall fn new)
+	new))))
+
+
+(defun freeze-entry (id entry)
+  (When (eq (symbol-function (entry-function entry)) #'non-method)
+    (do-map-method id entry))
+  (let* ((sym (entry-function entry))
+	 (new (make-symbol (symbol-name sym))))
+    (setf (symbol-function new) (symbol-function sym)
+	  (symbol-value new) (symbol-value sym)
+	  (entry-function entry) (entry-function entry)))
+  (let ((cmap (entry-cmap entry)))
+    (dotimes (i (length cmap))
+      (setf (aref cmap i) (freeze-entry id (aref cmap i))))))
+
+(defun freeze-instances (instance-descriptor)
+  "Makes the instances of this instance-descriptor deaf changes in 
+  method definition.  Use unfreeze-instance to wake it up again."
+  (maphash #'(lambda (mess entry)
+	       (declare (ignore mess))
+	       (freeze-entry instance-descriptor entry))
+	   (instance-descriptor-table instance-descriptor)))
+
+(defun unfreeze-instances (instance-descriptor)
+  "Undoes freeze-instances."
+  (declare (special instance-descriptor))
+  (maphash #'(lambda (mess entry)
+	       (declare (ignore mess))
+	       (do-map-method instance-descriptor entry))
+	   (instance-descriptor-table instance-descriptor)))
+
+;;;
+;;; Methods.
+;;;
+
+
+(defun-default-handler non-method (&rest args)
+  (multiple-value-bind (inner-self id) (self-and-descriptor self)
+    (declare (ignore inner-self))
+    (let ((fn (entry-function %entry)))
+      (cond ((not (symbolp fn))
+	     (error "Internal bogusness: ~S handler for ~S frozen unmapped."
+		    (get-message) self))
+	    ((eq fn (method-current-symbol (symbol-value fn)))
+	     (error "Undefined method ~A." fn))
+	    (t (do-map-method id %entry)
+	       (apply-entry self (get-message) %entry args))))))
+
+
+(defmacro map-ivs (ivs instance-ivs)
+  `(let ((ivs ,ivs)
+	 (instance-ivs ,instance-ivs))
+     (let ((res (if ivs (make-array (length ivs)))))
+       (dotimes (i (length ivs))
+	 (let ((pos (position (aref ivs i) instance-ivs)))
+	   (setf (aref res i) (if pos (1+ pos)))))
+       res)))
+
+;;; When we first map in a method, we make the cmap a simple vector.
+;;; The first time we remap, we make it a fill-pointered adjustable vector and
+;;; thereafter adjust it to the appropriate size. @#@#
+
+(defun do-map-method (id entry)
+  (let* ((structure (symbol-value (entry-function entry)))
+	 (ivs (method-ivs structure))
+	 (called-methods (method-calls structure))
+	 (instance-ivs (iv-env-vector (instance-descriptor-env id))))
+    (let ((cmap (if called-methods (make-array (length called-methods))))
+	  (map (map-ivs ivs instance-ivs))
+	  (new-sym (method-current-symbol (symbol-value (entry-function entry)))))
+      (do ((i (1- (length called-methods)) (1- i))
+	   (m called-methods (cdr m)))
+	  ((null m))
+	(let ((entry (make-entry :function (car m))))
+	  (do-map-method id entry)
+	  (setf (Aref cmap i) entry)))
+      (setf (entry-cmap entry) cmap
+	    (entry-map entry) map
+	    (entry-function entry) new-sym))))
+
+
+
+
+(defun remap-method
+       (method-fn-name
+	&optional
+	(new-function-object
+	 (symbol-function (method-current-symbol (symbol-value method-fn-name)))))
+  (let* ((structure (symbol-value method-fn-name))
+	 (new-symbol (make-symbol (symbol-name method-fn-name)))
+	 (current (method-current-symbol structure)))
+    (setf (symbol-value new-symbol) (symbol-value current)
+	  (symbol-function new-symbol) new-function-object
+	  (symbol-function current) #'non-method
+	  (method-current-symbol structure) new-symbol)))
+
+
+
+(defun update-method (fn-name ivs called-methods)
+  (if (boundp fn-name)
+      (let ((structure (symbol-value fn-name)))
+	(if (and (equalp ivs (method-ivs structure))
+		 (equalp called-methods (method-calls structure)))
+	    ;; No remapping necessary.  Set the current to the new function.
+	    ;; If we're still on the original, we needn't do anything.
+	    (unless (eq fn-name (method-current-symbol structure))
+	      (setf (symbol-function (method-current-symbol structure))
+		    (symbol-function fn-name)
+		    (symbol-function fn-name) #'non-method))
+	    (remap-method fn-name (symbol-function fn-name))))
+      (let ((structure (make-method fn-name called-methods ivs fn-name)))
+	(setf (symbol-value fn-name) structure))))
+
+;;; When a method-call or method-apply expands, it sees if it finds the 
+;;; called method in the list of methods this method is known to call.
+;;; If so, it just references the corresponding slot
+;;; (the last element gets slot zero) of the other-mapping-table.
+;;; If not, it pushes the new method onto the front of the list,
+;;; updates cmap (currently by remapping everything - ugh)
+;;; and references the new slot.
+
+(defvar *calling-ivs* nil)
+(DEfvar *calling-method* nil)
+(DEfvar *called-methods* nil)
+
+;;; Compiled: sml expands, install-method gets correct values, 
+;;; %calling-method disappears.
+;;; Interpreted: %calling-method is part of env; specials are nil at
+;;; runtime / expansion time.
+;;;
+
+(defmacro internal-define-method (method-fn-name env args body)
+  "(method-fn-name env args body)
+  Method-fn-name is a method-function-name (i.e. a symbol nobody else knows about).
+  Env is an iv-environment. Args is the arglist.
+  Body is a list of forms.
+
+  Expands to a form that, when evaluated, defines a handler."
+  `(compiler-let ((*calling-method* ',method-fn-name)
+		  (*calling-ivs* ',(iv-env-vector env))
+		  (*called-methods* nil))
+     (symbol-macro-let ((%calling-method ',method-fn-name)
+			(%calling-ivs ',(iv-env-vector env))
+			,@(iv-env-bindings env))
+       (defun-default-handler ,method-fn-name ,args ,@body)
+       (install-method ,method-fn-name))))
+
+
+(defmacro iv (name)
+  (if *calling-method*
+      `(%instance-ref self (svref (entry-map %entry)
+				  ,(position name *calling-ivs*)))
+      `(%instance-ref self (svref (entry-map %entry)
+				  (position ',name %calling-ivs)))))
+
+(defmacro find-method (method)
+  (if *calling-method*
+      (compiler-find-method method)
+      `(interpreter-find-method ',method %calling-method self %entry)))
+
+(defun interpreter-find-method (method caller self %entry)
+  (do ((list (method-calls (symbol-value caller)) (cdr list))
+       (len 0 (1+ len)))
+      ((null list)
+       (remap-method caller)
+       (push method (method-calls (symbol-value caller)))
+       (do-map-method (instance-descriptor self) %entry)
+       len)
+    (if (eq (Car list) method)
+	(return (length (cdr list))))))
+
+(Defun compiler-find-method (method)
+  (do ((list *called-methods* (cdr list))
+       (len 0 (1+ len)))
+      ((null list)
+       (push method *called-methods*)
+       len)
+    (if (eq (Car list) method)
+	(return (length (cdr list))))))
+
+(defmacro install-method (method)
+  `(update-method ',method ',(or *calling-ivs* '#()) ',*called-methods*))
+
+
+(defmacro method-call (method . args)
+  "Macro used inside internal-define-method, analogous to funcall.
+  Call like (method-call method-fn-name arg1 arg2...)."
+  `(let* ((slot (find-method ,method))
+	  (entry (aref (entry-cmap %entry) slot)))
+     (funcall-entry self (get-message) entry ,@args)))
+
+(defmacro method-apply (method . args)
+  "Macro used inside internal-define-method, analogous to apply.
+  Call like (method-apply method-fn-name arg1 arg2)."
+  `(let* ((slot (find-method ,method))
+	  (entry (aref (entry-cmap %entry) slot)))
+     (apply-entry self (get-message) entry ,@args)))
+
+(defun define-set-method (method-fn-name var)
+  "Defines a method that sets the given variable name."
+  (let ((vec (make-array 1 :initial-element var)))
+    (defun-default-handler random-setter (new)
+      (setf (%instance-ref self (svref (entry-map %entry) 0)) new))
+    (setf (symbol-function method-fn-name) #'random-setter)
+    (update-method method-fn-name vec nil)))
+
+(defun define-get-method (method-fn-name var)
+  "Defines a method that returns the given named variable."
+  (let ((vec (make-array 1 :initial-element var)))
+    (defun-default-handler random-getter ()
+      (%instance-ref self (svref (entry-map %entry) 0)))
+    (setf (symbol-function method-fn-name) #'random-getter)
+    (update-method method-fn-name vec nil)))
+
+______________________________________________________________________
+Flavors.slisp
+
+;;; -*- Mode:lisp; package: Flavors -*-
+;;;
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Flavors main file.
+;;; Written by Steven Handerson.
+;;;
+
+;;; Make *remember-wrapper-names* so that we can just remember the hash of
+;;; a combined method's wrappers.
+;;; MIXTURES.
+;;; Write other combination types.
+;;; Get-handler-for works on other types?
+
+;;; Things to check: abstract to non-abstract.
+
+#|
+(progn (hemlock::defindent "defbits" 0)
+       (hemlock::defindent "defwrapper" 0)
+       (hemlock::defindent "symbol-macro-let" 0)
+       (hemlock::defindent "defun-default-handler" 0)
+       (hemlock::defindent "defining-form" 0)
+       (hemlock::defindent "handle-message" 0)
+       (hemlock::defindent "with-stacks" 0)
+       (hemlock::defindent "do-stack-assoc" 0)
+       (hemlock::defindent "defdescribe" 0)
+       (hemlock::defindent "get-method-types" 0)
+       (hemlock::defindent "dovec" 0)
+       (hemlock::defindent "with-flavor-instantiated" 0)
+       (hemlock::defindent "do-inheriting-flavors" 0)
+       (hemlock::defindent "flavor-set-handlers" 0)
+       (hemlock::defindent "descriptor-set-handlers" 0)
+       (hemlock::defindent "do-methods" 0)
+       (hemlock::defindent "do-handlers" 0)
+       (hemlock::defindent "mydlet" 0)
+       (hemlock::defindent "defflavor" 2)
+       (hemlock::defindent "defcombination" 0)
+       (hemlock::defindent "defwrapper" 2)
+       (hemlock::defindent "defmethod" 2)
+       (hemlock::defindent "calculate-all-components" 0)
+       (hemlock::defindent "flavor-add-component" 0)
+       (hemlock::defindent "flavor-add-included" 0)
+       (hemlock::defindent "unless" 0)
+       (hemlock::defindent "labels" 0)
+       (hemlock::defindent "wrapper-mix" 0)
+       (hemlock::defindent "touch-components" 0)
+       (hemlock::defindent "touch" 0)
+       (hemlock::defindent "get-combination" 0)
+       (hemlock::defindent "set-combination" 0)
+       (hemlock::defindent "push-method" 0)
+       (hemlock::defindent "multiple-value-bind" 2)
+       (hemlock::defindent "defsetf" 0)
+       (hemlock::defindent "default-set-handlers" 3)
+       (hemlock::defindent "define-setf-method" 2)
+       )
+|#
+
+(in-package 'flavors)
+(use-package 'flavor-internals)
+
+(export '(send
+	  self
+	  symeval-in-instance
+	  set-in-instance
+	  get-handler-for
+
+	  vanilla-flavor
+
+	  *all-flavor-names*
+	  *undefined-flavor-names*
+	  *flavor-compile-methods*
+	  *default-combination*
+
+	  *dirty-flavors*
+	  cleanup-all-flavors
+	  cleanup-flavor
+	  without-cleaning-flavors
+
+	  defflavor
+	  undefflavor
+	  defmethod
+	  defwrapper
+	  defwhopper
+	  continue-whopper
+	  lexpr-continue-whopper
+	  continue-whopper-all
+	  undefmethod
+	  recompile-flavor
+	  make-instance
+	  flavor-allowed-init-keywords
+	  flavor-allows-init-keyword-p
+
+	  compile-flavor
+	  compiler-compile-flavors
+	  reconstruct-defflavor
+
+	  method-list
+	  call-methods
+	  wrapper-mix
+	  defcombination-ordering
+	  defcombination
+	  order-methods
+	  order-wrappers))
+
+(shadow '(nreversef))
+
+;;;
+;;; Random utilities.
+;;;
+
+;;; Takes a list of forms and returns values of a list of doc-strings
+;;; and declares, and a list of the remaining forms.
+
+(eval-when (compile eval load)
+  (defun extract-doc-and-declares (forms)
+    (do ((forms forms (cdr forms))
+	 (docs nil (cons (car forms) docs)))
+	((or (endp forms)
+	     (and (not (stringp (car forms)))
+		  (not (and (listp (car forms))
+			    (eq (caar forms) 'declare)))))
+	 (values (nreverse docs) forms))))
+
+  (defmacro mydlet (bindings &body body)
+    (let ((runtime nil))
+      (dolist (binding bindings)
+	(unless (null (Car binding))
+	  (let ((list (gensym)))
+	    (push `(,list ,@(cdr binding)) runtime)
+	    (mapcar #'(lambda (var) (push `(,var (pop ,list)) runtime))
+		    (car binding)))))
+      (cond ((null runtime) `(progn ,@body))
+	    (t `(let* ,(nreverse runtime)
+		  ,@body))))))
+
+(defun private-structure-printer (object stream depth)
+  (Declare (ignore depth))
+  (format stream "#<~A ~A>"
+	  (type-of object)
+	  (%primitive make-immediate-type object 16)))
+
+;;; Boolean variables shouldn't take up 32 bits.
+;;; Syntax and semantics like defstruct.
+
+(eval-when (compile eval load)
+  (Defmacro defbits (str-name &rest names)
+    (do ((i 0 (1+ i))
+	 (names names (cdr names))
+	 (res nil))
+	((null names) `(eval-when (compile eval load) ,@res))
+      (push `(defmacro ,(intern (concatenate 'string (symbol-name str-name)
+					     "-" (symbol-name (car names))))
+		       (thing)
+	       `(logbitp ,,i ,thing))
+	    res)))
+
+  ;; Assoc with a nicer setf method.
+
+  (defmacro my-assoc (key list)
+    "Just like simple assoc, but has a nice setf method."
+    `(cdr (assoc ,key ,list)))
+  
+  (define-setf-method my-assoc (key list)
+    (multiple-value-bind (temps vals stores store-form access-form)
+			 (get-setf-method list)
+      (let ((ktemp (gensym))
+	    (list (gensym))
+	    (assoc (gensym))
+	    (store (gensym))
+	    (stemp (first stores)))
+	(values `(,ktemp ,.temps ,list ,assoc)
+		`(,key ,.vals ,access-form (assoc ,ktemp ,list))
+		(list store)
+		`(if ,assoc
+		     (setf (cdr ,assoc) ,store)
+		     (let ((,stemp (cons (cons ,ktemp ,store) ,list)))
+		       ,store-form
+		       ,store))
+		`(cdr ,assoc)))))
+
+  (lisp::define-modify-macro nreversef () nreverse)
+
+  (defmacro dovec ((var vec) &body body)
+    `(let ((%vec ,vec))
+       (dotimes (%i (length %vec))
+	 (let ((,var (aref %vec %i)))
+	   ,@body)))))
+
+
+;;; Stacks are just dynamically allocated vectors with fill-pointers.
+
+(defvar %stacks% (make-array 100 :adjustable t :fill-pointer 0))
+
+
+(eval-when (compile eval load)
+  (defmacro with-stacks (names &body body)
+    (multiple-value-bind (docs forms) (extract-doc-and-declares body)
+      `(let ,(mapcar #'(lambda (name)
+			 `(,name (cond ((> (length %stacks%) 0)
+					(let ((res (vector-pop %stacks%)))
+					  (setf (fill-pointer res) 0)
+					  res))
+				       (t (make-array 1000 :adjustable t
+						      :fill-pointer 0)))))
+		     names)
+	 ,@docs
+	 (unwind-protect
+	   (progn ,@forms)
+	   ,@(mapcar #'(lambda (name)
+			 `(progn (fill ,name nil :end (array-dimension ,name 0))
+				 (vector-push-extend ,name %stacks%)))
+		     names)))))
+
+  (defmacro set-stack-length (stack size)
+    `(let ((stack ,stack)
+	   (size ,size))
+       (cond ((>= (array-dimension stack 0) size)
+	      (setf (fill-pointer stack) size))
+	     (t (adjust-array stack size)
+		(setf (fill-pointer stack) size))))))
+
+;;; Yech.  Still, if this is gonna get used as much as I think...
+
+(defvar *changed-method-stacks*
+  (let ((res (make-array 100 :fill-pointer t :adjustable t)))
+    (dotimes (i 100)
+      (setf (aref res i) (make-array 10 :adjustable t :fill-pointer 0)))
+    res)
+  "A bunch of small vectors used to record which methods need recalculating
+  for a flavor.")
+
+(defun alloc-tiny-stack ()
+  (or (vector-pop *changed-method-stacks*)
+      (make-array 10 :adjustable t :fill-pointer 0)))
+
+(defmacro dealloc-tiny-stack (place)
+  `(let ((%x (shiftf ,place nil)))
+     (when %x
+       (fill %x nil :end (array-dimension %x 0))
+       (vector-push-extend %x *changed-method-stacks*))))
+
+
+
+;;;
+;;; More specific to Flavors.
+;;; 
+
+
+(defmacro flavor-function-name (symbol &rest things)
+  "Usually called with flavor-name, method, and method-type.
+  Interns the name in the package of the first thing (a symbol)."
+  `(intern (concatenate
+	    'string (symbol-name ,symbol)
+	    ,@(mapcan #'(lambda (thing)
+			  `("-"  (let ((thing ,thing))
+				   (if (symbolp thing)
+				       (prin1-to-string thing)
+				       thing))))
+		      things))
+	   (symbol-package ,symbol)))
+
+
+(defun set-name (iv)
+  (cond ((get iv 'set-name))
+	(t (let ((res (intern (concatenate 'string "SET-" (symbol-name iv))
+			      (find-package 'keyword))))
+	     (setf (Get iv 'set-name) res)
+	     res))))
+
+(DEfun get-name (iv)
+  (cond ((get iv 'get-name))
+	(t (let ((res (intern (symbol-name iv) (find-package 'keyword))))
+	     (setf (get iv 'get-name) res)
+	     res))))
+
+(eval-when (compile eval load)
+  (defmacro combination-ordering (name)
+    `(let ((%combo ,name))
+       (or (get %combo 'ordering)
+	   (error "No such combination: ~S." %combo))))
+
+  (defmacro combination-mixer (name)
+    `(let ((%combo ,name))
+       (or (get %combo 'mixer)
+	   (error "No such combination: ~S." %combo))))
+
+  (defmacro make-combination (name ordering mixer)
+    `(progn (setf (get ,name 'ordering) ,ordering
+		  (get ,name 'mixer) ,mixer))))
+
+;;;
+;;; Environments.  
+;;;
+
+;;; Special values for the default: REQUIRED and UNSUPPLIED.
+
+
+(defstruct (method-env (:print-function private-structure-printer)
+		       (:include iv-env))
+  numordered ; number of vars ordered.
+  defaults   ; default forms.
+  ables)
+
+(defstruct (instance-env (:print-function private-structure-printer)
+			 (:include method-env))
+  required) ; list of required ivs.
+
+(defbits ables
+  gettable
+  settable
+  initable
+  outside-accessible)
+
+
+(eval-when (compile eval load)
+  (defmacro var-able (x)
+    `(aref ables
+	   (or (position ,x var-stack)
+	       (error "No such instance variable - ~S." ,x)))))
+
+(defun make-env (var-list ordered required 
+			  settable gettable initable outside)
+  (with-stacks (var-stack default-stack)
+    (dolist (o ordered)
+      (vector-push-extend o var-stack)
+      (vector-push-extend 'UNSUPPLIED default-stack))
+    (let ((numordered (length var-stack))
+	  temp)
+      (dolist (var var-list)
+	(cond ((listp var)
+	       (cond ((Setq temp (position (car var) var-stack))
+		      (setf (aref default-stack temp) (cadr var)))
+		     (t (vector-push-extend (car var) var-stack)
+			(vector-push-extend (cadr var) default-stack))))
+	      (t (cond ((setq temp (position var var-stack))
+			(setf (Aref default-stack temp) 'UNSUPPLIED))
+		       (t (vector-push-extend var var-stack)
+			  (vector-push-extend 'UNSUPPLIED default-stack))))))
+      (dolist (req required)
+	(cond ((find req var-stack))
+	      (t (vector-push-extend req var-stack)
+		 (vector-push-extend 'REQUIRED default-stack))))
+      (let* ((ables (make-array (length default-stack) :initial-element 0)))
+	(dolist (s settable) (setf (ables-settable (var-able s)) t
+				   (ables-gettable (var-able s)) t
+				   (ables-initable (var-able s)) t))
+	(dolist (g gettable) (setf (ables-gettable (var-able g)) t))
+	(dolist (i initable) (setf (ables-initable (var-able i)) t))
+	(dolist (o outside) (setf (ables-outside-accessible (var-able o)) t))
+	(make-method-env :numordered numordered
+			 :vector (copy-seq var-stack)
+			 :defaults (copy-seq default-stack)
+			 :ables ables)))))
+
+
+;;;
+;;; Flavor definition.
+;;;
+
+(defun-default-handler default-handler (&rest args)
+  (let ((message (get-message)))
+    (cond ((get-handler :unhandled-message (instance-descriptor self))
+	   (apply #'send self :unhandled-message message args))
+	  ((get-handler :print-self (instance-descriptor self))
+	   (error "Unhandled message ~S in instance ~S." message self))
+	  (t (error "Unhandled message ~S in #<Random Instance ~S>."
+		    message (%primitive make-immediate-type self 16))))))
+
+;;; Exported specials.
+
+(defvar *all-flavor-names* () "The list of all defined flavors.")
+(defvar *undefined-flavor-names* ()
+  "List of referred-to but not defflavored flavors.")
+(defvar *dirty-flavors* (make-array 100 :fill-pointer 0 :adjustable t)
+  "A vector (with fill pointer) of instantiated flavors that need work.")
+
+(defvar *flavor-compile-methods* T
+  "If T, new combined methods will automatically be compiled.")
+
+(Defvar *default-combination*'(:daemon . :base-flavor-last)
+  "Something like (:daemon . :base-flavor-last).")
+
+;;;
+;;; Internal specials.
+;;;
+
+;;; Options that alone mean all of the instance variables.
+(Defparameter *var-options*
+  '(:gettable-instance-variables
+    :settable-instance-variables :initable-instance-variables
+    :ordered-instance-variables :outside-accessible-instance-variables))
+
+(defbits changed
+  components		; Recompute all-components, compute everything if change.
+  required-flavors	; Check if we're instantiable.
+  required-ivs          ; Ditto.
+  iv-order              ; Maybe important to the kernel.
+  iv-inits              ; Someday the inits will be in a function.
+  all-methods           ; We only stay up-to-date if instantiated.  Redo all.
+  required-methods      ; See if instantiable.
+  required-inits	; Recompute cached quantities after we know it's inst.
+  default-plist		; 
+  init-keywords
+  iv-keywords)
+
+(defconstant %all-components-changed% #b11111111110)
+
+(defbits flags
+  vanilla-p
+  abstract-p
+  defined-p		; Defflavored.
+  compiled-p		; Compiled and non-abstract means instantiable.
+  			; Compiled and abstract means compiled methods.
+  wayward-p)            ; Has instances but is currently uninstantiable.
+
+
+(defstruct (flavor (:print-function print-flavor))
+  name
+  (components nil)
+  (included-flavors nil)
+  (required-flavors nil)
+  (required-methods nil)
+  (default-plist nil)
+  (init-keywords nil)
+  (required-inits nil)
+  (method-env nil)
+  (combinations nil)	; Assoc of name to combination 
+  (prefix nil)
+
+  (descriptor nil)
+  (required-inits* nil)
+  (init-keywords* nil)
+  (default-plist* nil)
+  (iv-keywords* nil)	; Assoc of var to position?
+
+  (dependents nil)
+  (changed 1)
+  (flags 0)
+  (methods (make-method-structure))
+  (all-components+ nil)
+  (instance-env nil)
+  (changed-methods nil)) ; Vector of lists.
+
+(defun print-flavor (object stream depth)
+  (declare (ignore depth))
+  (format stream "#<Flavor ~S>" (flavor-name object)))
+
+(eval-when (Compile eval load)
+
+  (defmacro flavor-defined-p (flavor)
+    `(flags-defined-p (flavor-flags ,flavor)))
+  (defmacro flavor-has-vanilla-p (flavor)
+    `(flags-vanilla-p (flavor-flags ,flavor)))
+  (defmacro flavor-abstract-p (flavor)
+    `(flags-abstract-p (flavor-flags ,flavor)))
+  (defmacro flavor-compiled-p (flavor)
+    `(and (flavor-defined-p ,flavor)
+	  (flags-compiled-p (flavor-flags ,flavor))))
+  (defsetf flavor-compiled-p (flavor) (new)
+    `(setf (flags-compiled-p (flavor-flags ,flavor)) ,new))
+  (defmacro flavor-wayward-p (flavor)
+    `(flags-wayward-p (flavor-flags ,flavor)))
+
+  (defmacro flavor-instantiated-p (flavor)
+    "Returns T for instantiated and wayward flavors."
+    `(or (flavor-wayward-p ,flavor)
+	 (and (flavor-descriptor ,flavor)
+	      (instance-descriptor-instantiated-p (flavor-descriptor ,flavor)))))
+
+  (defmacro get-flavor (name &optional createp)
+    `(let ((name ,name))
+       (cond ((get name 'flavor))
+	     (,createp (let ((res (make-flavor :name name)))
+			 (setf (get name 'flavor) res)
+			 (pushnew name *undefined-flavor-names*)
+			 res))
+	     (t (error "Flavor ~S does not exist." name)))))
+
+  (defmacro flavor-dirty-p (flavor)
+    `(or (plusp (flavor-changed ,flavor))
+	 (flavor-changed-methods ,flavor)))
+
+  (defmacro rework-flavor (flavor)
+    `(let ((flavor ,flavor))
+       (when (and (flavor-instantiated-p flavor)
+		  (not (flavor-dirty-p flavor)))
+	 (vector-push-extend flavor *dirty-flavors*))))
+
+  (defmacro rework-methods (flavor methods)
+    `(let ((flavor ,flavor))
+       (cond ((null (flavor-changed-methods flavor))
+	      (let ((stack (alloc-tiny-stack)))
+		(vector-push-extend ,methods stack)
+		(setf (flavor-changed-methods flavor) stack)))
+	     (t (vector-push-extend ,methods (flavor-changed-methods flavor))))))
+  
+  (defmacro do-inheriting-flavors ((var flavor &optional stack) &body body)
+    `(cond ((eq (flavor-name flavor) 'vanilla-flavor)
+	    (dolist (fl *all-flavor-names*)
+	      (let ((,var (get-flavor fl)))
+		,@(if stack `((vector-push-extend ,var ,stack)))
+		(when (flags-vanilla-p (flavor-flags ,var))
+		  ,@body))))
+	   (t ,(let* ((stack (or stack '%inheriting-flavors))
+		      (body `((vector-push-extend ,flavor ,stack)
+			      (do ((%i 0 (1+ %i)))
+				  ((>= %i (length ,stack)))
+				(let ((,var (aref ,stack %i)))
+				  ,@body)
+				(dolist (d (flavor-dependents (aref ,stack %i)))
+				  (unless (position d ,stack)
+				    (vector-push-extend d ,stack)))))))
+		 (if (eq stack '%inheriting-flavors)
+		     `(with-stacks (,stack) ,@body)
+		     `(progn ,@body)))))))
+
+
+(Defun message-clean-p (flavor method)
+  (not (or (changed-all-methods (flavor-changed flavor))
+	   (let ((stack (flavor-changed-methods flavor)))
+	     (dotimes (i (length stack))
+	       (let ((elt (aref stack i)))
+		 (when (or (eq method elt) (member method elt))
+		   (return t))))))))
+
+(defdescribe internal-describe-flavor flavor (flavor)
+  (when flavor
+    (cond ((flavor-dependents flavor)
+	   (terpri)
+	   (princ "It is a direct component of flavors: ")
+	   (princ (mapcar #'flavor-name (flavor-dependents flavor))))
+	  (t (terpri) (princ "No flavors currently refer to it.")))
+    (Cond ((not (flavor-defined-p flavor))
+	   (terpri)
+	   (princ "It's hasn't been defflavored yet."))
+	  (t (terpri)
+	     (princ "It was defflavored something like this:")
+	     (terpri)
+	     (write (reconstruct-defflavor (flavor-name flavor)) :pretty t
+		    :length nil :level nil)
+	     (when (flavor-compiled-p flavor)
+	       (cond ((flavor-dirty-p flavor)
+		      (terpri) (princ "It's compiled, but dirty."))
+		     (t (terpri) (princ "It's currently compiled.")))
+	       (cond ((flavor-wayward-p flavor)
+		      (terpri) (princ "It has wayward instances."))
+		     ((flavor-instantiated-p flavor)
+		      (terpri) (princ "It is instantiated."))))))))
+
+(defun reconstruct-defflavor (name)
+  "Returns a call to defflavor that was something pretty close to how
+  the flavor was defined."
+  (let* ((flavor (get-flavor name)))
+    (unless (Flavor-defined-p flavor)
+      (error "Flavor ~S has not been defflavored." name))
+    (let* ((env  (flavor-method-env flavor))
+	   (vec (iv-env-vector env))
+	   (defaults (method-env-defaults env))
+	   (ables (method-env-ables (flavor-method-env flavor)))
+	   (vars nil) (initable nil) (settable nil) (gettable nil)
+	   (required nil) (ordered nil) (accessible nil)
+	   (options nil))
+      (let ((numordered (method-env-numordered env)))
+	(dotimes (i (length vec))
+	  (let ((able (aref ables i))
+		(var (aref vec i))
+		(def (aref defaults i)))
+	    (case def
+	      (UNSUPPLIED (push var vars))
+	      (REQUIRED (push var required))
+	      (t (push (list var def) vars)))
+	    (cond ((ables-settable able) (push var settable))
+		  (t (when (ables-initable able) (push var initable))
+		     (when (ables-gettable able) (push var gettable))))
+	    (when (< i numordered) (push var ordered))
+	    (when (ables-outside-accessible able) (push var accessible)))))
+      (if initable (push `(:initable-instance-variables ,@initable) options))
+      (if settable (push `(:settable-instance-variables ,@settable) options))
+      (if gettable (push `(:gettable-instance-variables ,@gettable) options))
+      (if required (push `(:required-instance-variables ,@required) options))
+      (if ordered (push `(:ordered-instance-variables ,@(nreverse ordered))
+			options))
+      (if accessible
+	  (push `(:outside-accessible-instance-variables ,@accessible) options))
+      (if (not (flavor-has-vanilla-p flavor)) (push :no-vanilla-flavor options))
+      (if (flavor-abstract-p flavor) (push :abstract-flavor options))
+      (if (flavor-init-keywords flavor)
+	  (push `(:init-keywords ,@(flavor-init-keywords flavor)) options))
+      (if (flavor-default-plist flavor)
+	  (push `(:default-init-plist ,@(flavor-default-plist flavor)) options))
+      (if (flavor-required-inits flavor)
+	  (push `(:required-init-keywords ,@(flavor-required-inits flavor))
+		options))
+      (if (flavor-required-methods flavor)
+	  (push `(:required-methods ,@(flavor-required-methods flavor)) options))
+      (if (Flavor-required-flavors flavor)
+	  (push `(:required-flavors ,@(flavor-required-flavors flavor)) options))
+      (if (flavor-included-flavors flavor)
+	  (push `(:included-flavors ,@(flavor-included-flavors flavor)) options))
+      (if (not (equalp (flavor-prefix flavor)
+		       (concatenate 'string (symbol-name (flavor-name flavor))
+				    "-")))
+	  (push `(:accessor-prefix ,(intern (flavor-prefix flavor)
+					    (symbol-package (flavor-name flavor))))
+		options))
+      (when (flavor-combinations flavor)
+	(let ((combos nil))
+	  (dolist (cons (flavor-combinations flavor))
+	    (push (car cons) (my-assoc (cdr cons) combos))
+	  (mapl #'(lambda (list)
+		    (setf (cdr (caar list)) (list (cdr (caar list)))))
+		combos)
+	  (push `(:method-combination ,@combos) options))))
+      (when (documentation (flavor-name flavor) 'flavor)
+	(push `(:documentation ,(documentation (flavor-name flavor) 'flavor))
+	      options))
+      `(defflavor ,(flavor-name flavor) ,(nreverse vars)
+	 ,(flavor-components flavor)
+	 ,@options))))
+
+
+
+;;;
+;;; Method structures
+;;;
+
+(defstruct (method-structure (:print-function private-structure-printer)
+			     (:constructor make-method-structure
+					   (&optional methods)))
+  methods
+  (types (make-list (length methods))))
+
+(defun %get-method-types (name structure &optional create)
+  "Returns a list whose car is the list of types."
+  (let ((pos (position name (method-structure-methods structure))))
+    (if pos (nthcdr pos (method-structure-types structure))
+	(when create
+	  (push name (method-structure-methods structure))
+	  (push nil (method-structure-types structure))))))
+
+(eval-when (compile eval load)
+
+  (defmacro get-method-types (name structure &optional create)
+    `(%get-method-types ,name ,structure ,create))
+
+  (defmacro do-methods ((var structure) &body body)
+    `(let ((%str ,structure))
+       (macrolet ((get-method-types (name str &optional create)
+		    (cond ((and (eq name ',var) (eq str ',structure)) '(car %list))
+			  (t `(%get-method-types ,name ,str ,create)))))
+	 (do ((%m (method-structure-methods %str) (cdr %m))
+	      (%list (method-structure-types %str) (cdr %list)))
+	     ((null %m))
+	   (unless (null (car %list))
+	     (let ((,var (car %m)))
+	       ,@body))))))
+  
+  (defmacro method-types (name structure)
+    `(car (get-method-types ,name ,structure)))
+
+  (defsetf method-types (name structure) (new)
+    `(and ,new
+	  (setf (car (get-method-types ,name ,structure t)) ,new))))
+
+(defun method-add (name type fn-name structure)
+  (let* ((list (get-method-types name structure t)))
+    (let ((assoc (assoc type (car list))))
+      (cond (assoc
+	     (cond ((eq (cdr assoc) fn-name) nil)
+		   (t (SEtf (cdr assoc) fn-name) t)))
+	    (t (push (cons type fn-name) (car list))
+	       t)))))
+
+(defun Method-find (name type structure)
+  (let ((list (get-method-types name structure)))
+    (and list (cdr (assoc type (car list))))))
+
+;;;
+;;; Components, environment
+;;;
+
+
+;;; First we do a depth-first walk of the components.
+;;; Into this list we insert all included flavors and their not-already-present
+;;; components after the last flavor to include them.
+;;; @#@# The order in which this is done is important: do we add includeds from
+;;;  the end or from the beginning?
+;;; Lastly, we add vanilla-flavor unless a components says not to.
+
+(defun calculate-all-components (flavor undefined)
+  (with-stacks (components-stack second-stack)
+    (let ((undefined-flavors nil) (undefined-includeds nil))
+      (labels ((flavor-add-component (flavor)
+		 (vector-push-extend flavor components-stack)
+		 (dolist (c (flavor-components flavor))
+		   (setq c (get-flavor c t))
+		   (cond ((flavor-defined-p c)
+			  (unless (find c components-stack)
+			    (flavor-add-component c)))
+			 (t (push (flavor-name c) undefined-flavors))))))
+	(flavor-add-component flavor)
+	(dotimes (i (length components-stack))
+	  (labels
+	    ((flavor-add-included (flavor)
+	       (cond ((not (flavor-defined-p flavor))
+		      (push (flavor-name flavor) undefined-includeds))
+		     ((or (find flavor components-stack :start i)
+			  (find flavor second-stack)))
+		     (t (vector-push-extend flavor second-stack)
+			(dolist (c (flavor-components flavor))
+			  (flavor-add-included (get-flavor c t)))
+			(dolist (incl (flavor-included-flavors flavor))
+			  (flavor-add-included (get-flavor incl t)))))))
+	    (let ((flav (aref components-stack i)))
+	      (vector-push-extend flav second-stack)
+	      (dolist (incl (flavor-included-flavors flav))
+		(unless
+		  (find incl components-stack :test
+			#'(lambda (incl c)
+			    (member incl (flavor-included-flavors c))))
+		  (flavor-add-included incl))))))
+	(unless (find-if #'(lambda (c) (not (flavor-has-vanilla-p c)))
+			 second-stack)
+	  (vector-push-extend (get-flavor 'vanilla-flavor) second-stack)))
+      (cond ((car undefined-flavors)
+	     (funcall undefined (flavor-name flavor) undefined-flavors))
+	    (T (when (car undefined-includeds)
+		 (format *error-output* "Undefined included flavors ignored - ~S."
+			 undefined-includeds))
+	       (coerce second-stack 'list)))))))
+
+;;; We make one pass to get the ordered instance variables; any flavor
+;;; that specifies ordered variables should list the same ones
+;;; first as any other.
+;;; Required variables (those with 'REQUIRED as a default) get
+;;; replaced in the stack with the first real iv encountered.
+;;; @#@# Generally the first iv to supply a default sets it?
+;;; Ables flags (initable, settable, etc.) are ored together.
+
+	     
+(defun calculate-instance-env (flavor)
+  (with-stacks (ables-stack default-stack variables-stack)
+    (let* ((ordered 0) (ovars '#()) oflavor temp)
+      (dolist (flavor (flavor-all-components flavor))
+	(let* ((env (flavor-method-env flavor))
+	       (newnum (method-env-numordered env))
+	       (newvars (iv-env-vector env))
+	       (diff (mismatch newvars ovars :end2 ordered :end1 ordered)))
+	  (macrolet
+	    ((diff ()
+	       '(if diff
+		    (error "Ordered variable ~S in flavor ~S conflicts ~
+			   with ordered variable ~S in flavor ~S."
+			   (aref ovars diff) (flavor-name oflavor)
+			   (aref newvars diff) (flavor-name flavor)))))
+	    (cond ((> newnum ordered)
+		   (diff) (setq ovars newvars ordered newnum))
+		  (t (diff))))))
+      (setf (fill-pointer variables-stack) ordered
+	    (fill-pointer default-stack) ordered
+	    (fill-pointer ables-stack) ordered)
+      (replace variables-stack ovars :end1 ordered)
+      (fill default-stack 'UNSUPPLIED)
+      (fill ables-stack 0)
+      (dolist (flavor (flavor-all-components flavor))
+	(let* ((env (flavor-method-env flavor))
+	       (vec (iv-env-vector env)))
+	  (dotimes (i (length vec))
+	    (let ((var (aref vec i)))
+	      (cond ((setq temp (position var variables-stack))
+		     (when (eq 'UNSUPPLIED (aref default-stack temp))
+		       (setf (Aref default-stack temp)
+			     (aref (method-env-defaults env) i)
+			     (aref ables-stack temp)
+			     (logior (aref (method-env-ables env) i)
+				     (aref ables-stack temp)))))
+		    (t (vector-push-extend var variables-stack)
+		       (vector-push-extend (aref (method-env-defaults env) i)
+					   default-stack)
+		       (vector-push-extend (aref (method-env-ables env) i)
+					   ables-stack)))))))
+      (make-instance-env :numordered ordered
+			 :vector (copy-seq variables-stack)
+			 :defaults (copy-seq default-stack)
+			 :ables (copy-seq ables-stack)
+			 :required
+			 (let (res)
+			   (dotimes (i (length default-stack))
+			     (when (eq 'REQUIRED (aref default-stack i))
+			       (push (aref variables-stack i) res)))
+			   res)))))
+
+;;;
+;;; Defflavor
+;;;
+
+;;; %flavor-forms calculates the currently valid accessor forms (etc.?)
+;;; Later operation can figure out which ones are no longer valid.
+
+(defmacro defflavor (flavor-name ivs components &rest options)
+  "(flavor-name iv-list component-list . options)
+  Refer to the flavor documentation for details."
+  (%defflavor flavor-name ivs components options)
+  `(progn (eval-when (load)
+	    (%defflavor ',flavor-name ',ivs ',components ',options))
+	  ,.(%flavor-forms flavor-name)
+	  ',flavor-name))
+
+
+;;; Constructs the list of defstruct-like accessor definitions.
+
+(Defun %flavor-forms (flavor-name)
+  (let* ((flavor (get-flavor flavor-name))
+	 (prefix (flavor-prefix flavor))
+	 (env (flavor-method-env flavor))
+	 (vec (iv-env-vector env))
+	 (numordered (method-env-numordered env))
+	 (ables (method-env-ables env))
+	 (defaults (method-env-defaults env))
+	 (forms nil))
+    (do ((inits nil)
+	 (i (1- (length vec)) (1- i)))
+	((minusp i)
+	 (cons `(defmethod (,flavor-name INTERNAL-INIT) () (setq ,@inits))
+	       forms))
+      (let ((def (aref defaults i))
+	    (var (aref vec i)))
+	(unless (or (eq def 'REQUIRED) (eq def 'UNSUPPLIED))
+	  (push def inits)
+	  (push var inits))
+	(when (ables-outside-accessible (aref ables i))
+	  (let* ((print-name (symbol-name (aref vec i)))
+		 (name (intern (concatenate 'string prefix print-name)
+			       (symbol-package (flavor-name flavor)))))
+	    (cond
+	     ((< i numordered)
+	      (push `(progn
+		      (proclaim '(inline ,name))
+		      (defun ,name (self) (instance-ref self ,i))
+		      (defsetf ,name (self) (new)
+			`(setf (instance-ref ,self ,,i) ,new)))
+		    forms))
+	     (t (let ((set (make-symbol (concatenate 'string "%SET-" print-name)))
+		      (get (make-symbol (concatenate 'string "%GET-" print-name)))
+		      (var (aref vec i)))
+		  (push `(progn
+			  (proclaim '(inline ,name))
+			  (defun ,name (self) (send self ',get))
+			  (defsetf ,name (self) (new) `(send ,self ',',set ,new))
+			  (defmethod (,flavor-name ,get) () ,var)
+			  (defmethod (,flavor-name ,set) (new) (setq ,var new)))
+			forms))))))))))
+
+
+
+(defun %defflavor (flavor-name ivs components options)
+  (let* ((flavor (get-flavor flavor-name t))
+	 (iv-list (mapcar #'(lambda (x) (if (listp x) (car x) x)) ivs))
+	 (old-components (flavor-components flavor))
+	 (old-includeds (flavor-included-flavors flavor))
+	 included-flavors
+	 (vanilla-p t)
+	 (changed 0)
+	 (abstract-p nil)
+	 (combinations '((INTERNAL-INIT :progn . :base-flavor-last)))
+	 changed-methods
+	 ordered required settable gettable initable outside
+	 env required-methods required-flavors
+	 default-plist init-keywords required-inits prefix
+	 args)
+    (dolist (opt options)
+      (cond ((listp opt) (setq args (cdr opt) opt (car opt)))
+	    ((member opt *var-options*) (setq args iv-list))
+	    (t (setq args t)))
+      (case opt
+	(:method-order nil)
+	(:required-instance-variables (Setq required args))
+	(:ordered-instance-variables (setq ordered args))
+	(:settable-instance-variables (setq settable args))
+	(:gettable-instance-variables (setq gettable args))
+	(:initable-instance-variables (setq initable args))
+	(:outside-accessible-instance-variables (setq outside args))
+	(:no-vanilla-flavor (setq vanilla-p nil))
+	(:abstract-flavor (setq abstract-p t))
+	(:documentation (setf (documentation flavor-name 'flavor) (car args)))
+	(:accessor-prefix (setq prefix (symbol-name (Car args))))
+	(:required-methods (setq required-methods args))
+	(:required-flavors (setq required-flavors args))
+	(:included-flavors (setq included-flavors args))
+	(:init-keywords (setq init-keywords args))
+	(:default-init-plist (setq default-plist args))
+	(:required-init-keywords (setq required-inits args))
+	(:method-combination
+	 (dolist (ordering args)
+	   (let ((combination (cons (car ordering) (cadr ordering))))
+	     (dolist (method (cddr ordering))
+	       (push (cons method combination) combinations)))))
+	(t (error "Unknown defflavor option ~S." opt))))
+    (setq env (make-env ivs ordered required settable gettable initable outside)
+	  prefix (or prefix (concatenate 'string (symbol-name flavor-name) "-")))
+
+    (when (not (and (equal components old-components)
+		    (equal included-flavors old-includeds)
+		    (eq vanilla-p (flavor-has-vanilla-p flavor))
+		    (flavor-defined-p flavor))) ; If we're an undefined included.
+      (setf (changed-components changed) t)
+      (do-inheriting-flavors (i flavor)
+	(rework-flavor i)
+	(setf (changed-components (flavor-changed i)) t))
+      (setf (flavor-included-flavors flavor) included-flavors
+	    (flavor-components flavor) components
+	    (flavor-has-vanilla-p flavor) vanilla-p)
+      (dolist (c components)
+	(pushnew flavor (flavor-dependents (Get-flavor c)))))
+    
+    (setf (changed-required-flavors changed)
+	  (not (equal required-flavors (flavor-required-flavors flavor)))
+	  (changed-required-methods changed)
+	  (not (equal required-methods (flavor-required-methods flavor)))
+	  (changed-default-plist changed)
+	  (not (equal default-plist (flavor-default-plist flavor)))
+	  (changed-init-keywords changed)
+	  (not (equal init-keywords (flavor-init-keywords flavor)))
+	  (changed-required-inits changed)
+	  (not (Equal required-inits (flavor-required-inits flavor))))
+
+    ;; This has been done pretty lazily.
+    (let* ((old-env (flavor-method-env flavor)))
+      (cond ((null old-env))
+	    ((not (equalp (iv-env-vector env) (iv-env-vector old-env)))
+	     (setf (changed-iv-order changed) t
+		   (changed-required-ivs changed) t
+		   (changed-iv-inits changed) t))
+	    (t (let ((old-env-ables (method-env-ables old-env))
+		     (env-ables (method-env-ables env)))
+		 (dotimes (i (length env-ables))
+		   (when (not (eq (ables-initable (aref env-ables i))
+				  (ables-initable (aref old-env-ables i))))
+		     (setf (changed-iv-keywords changed) t)))))))
+    
+    (dolist (c (flavor-combinations flavor))
+      (when (not (member c combinations :test #'equal))
+	(pushnew (car c) changed-methods)))
+    (dolist (c combinations)
+      (when (not (member c (flavor-combinations flavor) :test #'equal))
+	(pushnew (car c) changed-methods)))
+    
+    (when (and (not (flavor-abstract-p flavor))
+	       abstract-p
+	       (flavor-instantiated-p flavor)
+	       (not (flavor-wayward-p flavor)))
+      (setf (flavor-wayward-p flavor) t)
+      (format *error-output* "Instances of flavor ~S temporarily dissociated:~%~
+	      it is now an abstract flavor."
+	      (flavor-name flavor))
+      (setf (flavor-abstract-p flavor) t)
+      (freeze-instances (flavor-descriptor flavor)))
+    (when (and (flavor-abstract-p flavor)
+	       (not abstract-p))
+      (setq changed (logior %all-components-changed% changed))
+      (setf (flavor-changed flavor) %all-components-changed%
+	    (flavor-abstract-p flavor) nil))
+    (let ((defined-methods (flavor-methods flavor)))
+      (dolist (s settable)
+	(let ((method (get-name s)))
+	  (unless (method-find method :primary defined-methods)
+	    (let ((fn (flavor-function-name flavor-name method :primary)))
+	      (define-get-method fn s)
+	      (method-add method :primary fn defined-methods)
+	      (push method changed-methods))))
+	(let ((method (set-name s)))
+	  (unless (method-find method :primary defined-methods)
+	    (let ((fn (flavor-function-name flavor-name method :primary)))
+	      (define-set-method fn s)
+	      (method-add method :primary fn defined-methods)
+	      (push method changed-methods)))))
+      (dolist (g gettable)
+	(let ((method (get-name g)))
+	  (unless (method-find method :primary defined-methods)
+	    (let ((fn (flavor-function-name flavor-name method :primary)))
+	      (define-get-method fn g)
+	      (method-add method :primary fn defined-methods)
+	      (push method changed-methods)))))
+      (when (flavor-defined-p flavor)
+	(let* ((ables (method-env-ables env))
+	       (vec (iv-env-vector env)))
+	  (dotimes (i (length vec))
+	    (let ((var (aref vec i)))
+	      (when (and (ables-settable (aref ables i))
+			 (not (member var settable)))
+		(let ((name (set-name var)))
+		  (deletef :primary (method-types name defined-methods)
+			   :key #'car)
+		  (push name changed-methods)))
+	      (when (and (ables-gettable (aref ables i))
+			 (not (member var gettable)))
+		(let ((name (get-name var)))
+		  (deletef :primary (method-types name defined-methods)
+			   :key #'car)
+		  (push name changed-methods))))))))
+
+    (macrolet ((doit ()
+		     '(setf (flavor-changed flavor) changed
+			    (flavor-method-env flavor) env
+			    (flavor-combinations flavor) combinations
+			    (flavor-required-methods flavor) required-methods
+			    (flavor-required-flavors flavor) required-flavors
+			    (flavor-prefix flavor) prefix
+			    (flavor-default-plist flavor) default-plist
+			    (flavor-init-keywords flavor) init-keywords
+			    (flavor-required-inits flavor) required-inits
+			    (flavor-defined-p flavor) t)))
+      (cond ((not (And (zerop changed) (null changed-methods)))
+	     (with-stacks (affected)
+	       (do-inheriting-flavors (i flavor affected)
+		 (rework-flavor i)
+		 (setf (flavor-changed i) (logior changed (flavor-changed i)))
+		 (if changed-methods (rework-methods i changed-methods)))
+	       (doit)
+	       (with-stacks (ordered)
+		 (order-flavors affected ordered)
+		 (dotimes (i (length ordered))
+		   (cleanup-flavor (aref ordered i))))))
+	    (t (doit)))
+      (push (flavor-name flavor) *all-flavor-names*)
+      (deletef (flavor-name flavor) *undefined-flavor-names*))))
+
+
+
+
+
+;;;
+;;;
+;;; This is the heart of flavors - the routine that calculates the various
+;;; parts of a flavor in sequence.  Flavor-all-components is split off 
+;;; so that it can be used in other places.
+;;;
+
+
+(defvar *cleanup-enable* T "If nil, cleanup is suppressed.")
+
+(defmacro without-cleaning-flavors (&body forms)
+  "Suppresses heavy flavors calculation inside the body.  Useful when
+  defining a series of wrappers or something, especially if you have
+  *flavor-compile-methods* set to T."
+  `(progn (let ((*cleanup-enable* nil))
+	    ,@forms)
+	  (setq *cleanup-enable* nil)))
+
+(defvar *flavors-compile* nil) ; If T, not just cleaning up.
+;; Used by compiler-compile-flavors, so it can set the handlers itself.")
+(defvar *dont-do-methods* nil) 
+
+(defvar *uninstantiable* nil) ; (flavor why-string &rest why-args)
+(defvar *inheritablep* nil) ; (flavor message) --> T, nil, or :redefine
+(defvar *definer* nil) ; (message form)
+(defvar *set-handlers* nil) ; (flavor name-stack fn-stack all-p)
+;; Note: nil means no handler
+
+(defvar *methods* nil) ; Assoc of name to assoc of slot to list of methods.
+(defvar *description* nil) ; A vector of slot seqs, pushed onto by order-wrappers
+(defvar *called-methods* nil) ; A stack that gets push-newed onto.
+(defvar *message* nil) ; Used to pass message to the ordering functions.
+
+
+;;;
+;;; Stuff used in cleaning up.
+;;; 
+
+
+(defun dissociate-instances (flavor why &rest why-args)
+  (cond ((and (flavor-instantiated-p flavor)
+	      (not (flavor-wayward-p flavor)))
+	 (setf (flavor-wayward-p flavor) t)
+	 (format *error-output*
+		 "Instances of flavor ~S temporarily dissociated:~%"
+		 (flavor-name flavor))
+	 (apply #'format *error-output* why why-args)
+	 (let ((descriptor (flavor-descriptor flavor)))
+	   (freeze-instances descriptor)))
+	(*flavors-compile*
+	 (format *error-output*
+		 "Could not instantiated flavor ~S:~%")
+	 (apply #'format *error-output* why why-args))))
+
+;;; This should only get called if the flavor is instantiable, not wayward.
+
+(defun flavor-set-handlers (flavor names fns all-p)
+  (labels
+    ((descriptor-set-handlers (descriptor names fn-stack all-p)
+       (when descriptor
+	 (dotimes (i (length names))
+	   (cond ((aref fn-stack i)
+		  (handle-message (aref names i) descriptor (aref fn-stack i)))
+		 (t (unhandle-message (aref names i) descriptor))))
+	 (when all-p
+	   (do-handlers ((h fn) descriptor)
+	     (declare (ignore fn))
+	     (unless (find h names)
+	       (unhandle-message h descriptor)))))))
+    (let* ((old-desc (flavor-descriptor flavor))
+	   (env (flavor-instance-env flavor))
+	   (waywardp (flavor-wayward-p flavor)))
+      (cond ((null old-desc)
+	     (let ((new (make-instance-descriptor (flavor-name flavor)
+						  env 'default-handler)))
+	       (descriptor-set-handlers new names fns all-p)
+	       (setf (flavor-descriptor flavor) new)))
+	    ((or (and (flavor-instantiated-p flavor)
+		      (not (equalp (instance-env-vector env)
+				   (instance-env-vector
+				    (instance-descriptor-env old-desc)))))
+		 waywardp)
+	     (let ((new-desc (make-instance-descriptor
+			      (flavor-name flavor) env 'default-handler)))
+	       (descriptor-set-handlers new-desc names fns all-p)
+	       (resize-instances old-desc new-desc
+				 #'(lambda (self)
+				     (SEnd self 'INTERNAL-INIT)))
+	       (setf (flavor-descriptor flavor) new-desc
+		     (flavor-wayward-p flavor) nil))
+	     (When waywardp
+	       (format *error-output*
+		       "Instances of flavor ~S reunited with the flavor."
+		       (flavor-name flavor))))
+	    (t (descriptor-set-handlers
+		 (flavor-descriptor flavor) names fns all-p))))))
+
+(defvar *undefined-components*
+  #'(lambda (f c) (error "Flavor ~S has undefined components - ~S." f c)))
+
+(defun flavor-all-components (flavor)
+  (when (or (changed-components (flavor-changed flavor))
+	    (null (flavor-all-components+ flavor)))
+    (setf (flavor-all-components+ flavor)
+	  (calculate-all-components flavor *undefined-components*)
+	  (flavor-changed flavor) %all-components-changed%))
+  (flavor-all-components+ flavor))
+
+
+;;; First, get a stack of the methods we want to compile.
+;;; Then do a pass to get the combination.
+;;; Then do a pass to order the methods.
+;;; (Note that we get the :base-flavor-last methods in the reverse order).
+;;; Then go through the methods and generate the code.
+
+(defun internal-cleanup-flavor
+       (flavor &optional (really *cleanup-enable*)
+	       &aux all-components (*flavors-compile* *flavors-compile*))
+  (unless really (return-from internal-cleanup-flavor nil))
+  (if *flavors-compile*
+      (if (flavor-compiled-p flavor) (setq *flavors-compile* nil)
+	  (setf (flavor-changed flavor)
+		(logior %all-components-changed% (flavor-changed flavor))))
+      (unless (flavor-compiled-p flavor)
+	(return-from internal-cleanup-flavor nil)))
+  (setq all-components (flavor-all-components flavor))
+  (when (changed-required-flavors (flavor-changed flavor))
+    (cond ((flavor-abstract-p flavor))
+	  (t (dolist (c all-components)
+	       (let ((rflavors nil))
+		 (dolist (f (flavor-required-flavors c))
+		   (unless (member f all-components) (push f rflavors)))
+		 (when rflavors
+		   (funcall *uninstantiable* flavor
+			    "Additional required flavors: ~S." rflavors))))))
+    (setf (changed-required-flavors (flavor-changed flavor)) nil))
+  (when (let ((changed (flavor-changed flavor)))
+	  (or (changed-iv-order changed)
+	      (changed-required-ivs changed)
+	      (changed-iv-inits changed)))
+    (let ((new-env (setf (flavor-instance-env flavor)
+			 (calculate-instance-env flavor))))
+      (when (instance-env-required new-env)
+	(unless (flavor-abstract-p flavor)
+	  (funcall *uninstantiable*
+		   flavor "Required instance variables ~S."
+		   (instance-env-required new-env))))
+      (setf (changed-required-ivs (flavor-changed flavor)) nil)))
+  (setf (changed-iv-order (flavor-changed flavor)) nil
+	(changed-iv-inits (Flavor-changed flavor)) nil)
+
+  (catch 'dont-do-methods
+    (if *dont-do-methods* (throw 'dont-do-methods nil))
+    (with-stacks (methods combinations functions *description* *called-methods*)
+      (cond ((changed-all-methods (Flavor-changed flavor))
+	     (dolist (c all-components)
+	       (let ((str (flavor-methods c)))
+		 (do-methods (m str)
+		   (unless (find m methods)
+		     (when (find :combined (get-method-types m str) :key #'car
+				 :test-not #'eq)
+		       (vector-push-extend m methods)))))))
+	    ((flavor-changed-methods flavor)
+	     (let ((vec (flavor-changed-methods flavor)))
+	       (dotimes (i (length vec))
+		 (let ((elt (aref vec i)))
+		   (if (listp elt)
+		       (dolist (e elt)
+			 (unless (find e methods)
+			   (vector-push-extend e methods)))
+		       (unless (find elt methods)
+			 (vector-push-extend elt methods))))))))
+      (when (zerop (length methods)) (throw 'dont-do-methods nil))
+      (set-stack-length combinations (length methods))
+      (set-stack-length functions (length methods))
+      (labels
+	((defining-form (fn flavor description form)
+	   (declare (inline defining-form))
+	   `(progn (setf (get ',fn 'description) ',(copy-seq description))
+		   (internal-define-method
+		    ,fn ,(flavor-instance-env flavor) (&rest %combined-args)
+		    ,(list form))
+		   (method-add
+		    ',*message* :combined ',fn
+		    (flavor-methods (get-flavor ',(flavor-name flavor)))))))
+	(let ((*methods* nil))
+	  (dolist (c all-components)
+	    (dotimes (i (length methods))
+	      (let* ((*message* (aref methods i))
+		     (newc (cdr (assoc *message* (flavor-combinations c))))
+		     oldc)
+		(when newc
+		  (cond ((setq oldc (aref combinations i))
+			 (if (not (equal newc oldc))
+			     (error "Method combination conflict for method ~S."
+				    *message*)))
+			(t (setf (aref combinations i) newc)))))))
+	  (dolist (c all-components)
+	    (let ((defined-methods (Flavor-methods c)))
+	      (dotimes (i (length methods))
+		(let* ((*message* (aref methods i))
+		       (type-assoc (method-types *message* defined-methods)))
+		  (unless (null type-assoc)
+		    (let ((comb (or (aref combinations i) *default-combination*)))
+		      (funcall (combination-ordering (car comb)) (cdr comb)
+			       type-assoc)))))))
+	  (dotimes (i (length methods))
+	    (let* ((*message* (aref methods i))
+		   (comb (or (aref combinations i) *default-combination*)))
+	      (setf (fill-pointer *description*) 0)
+	      (funcall (combination-ordering (car comb)) (cdr comb) nil t)
+	      (let (inherit fn)
+		(dolist (c all-components)
+		  (setq fn (method-find *message* :combined (flavor-methods c)))
+		  (when (setq inherit
+			      (and fn (equalp *description* (get fn 'description))
+				   (= (length (method-called-methods fn))
+				      (length *called-methods*))
+				   (every #'(lambda (m) (find m *called-methods*))
+					  (method-called-methods fn))
+				   (funcall *inheritablep* c *message*)))
+		    (return nil)))
+		(cond
+		 ((or (eq inherit :redefine) (null inherit))
+		  (unless fn (setq fn (flavor-function-name
+				       (flavor-name flavor) *message* :combined)))
+		  (let ((form
+			 (funcall (combination-mixer (car comb)) (cdr comb))))
+		    (cond ((eq (car form) 'method-apply)
+			   (setf (ARef functions i) (Cadr form)))
+			  (t (funcall *definer* fn
+				      (defining-form fn flavor *description* form))
+			     (setf (aref functions i) fn)))))
+		 (t (setf (Aref functions i) fn))))))))
+      (when (changed-required-methods (flavor-changed flavor))
+	(cond ((flavor-abstract-p flavor))
+	      (t (let ((rmethods nil))
+		   (dolist (c all-components)
+		     (dolist (m (flavor-required-methods c))
+		       (unless (or (aref functions (position m methods))
+				   (and (flavor-descriptor flavor)
+					(get-handler m
+						     (flavor-descriptor flavor))))
+			 (push m rmethods))))
+		   (when rmethods
+		     (funcall *uninstantiable* flavor
+			      "Additonal required methods: ~S." rmethods)))))
+	(setf (changed-required-methods (flavor-changed flavor)) nil))
+      (unless (flavor-abstract-p flavor)
+	(funcall *set-handlers* flavor methods functions
+		 (changed-all-methods (flavor-changed flavor))))))
+  (dealloc-tiny-stack (flavor-changed-methods flavor))
+  (setf (changed-all-methods (Flavor-changed flavor)) nil)
+  (setf (flavor-compiled-p flavor) t)
+  (when (changed-iv-keywords (flavor-changed flavor))
+    (let* ((env (flavor-instance-env flavor))
+	   (vec (iv-env-vector env))
+	   (ables (method-env-ables env))
+	   (keyword (find-package "KEYWORD"))
+	   res)
+      (dotimes (i (length vec))
+	(when (ables-initable (Aref ables i))
+	  (push (cons (intern (symbol-name (aref vec i)) keyword) i) res)))
+      (setf (flavor-iv-keywords* flavor) res))
+    (setf (changed-iv-keywords (flavor-changed flavor)) nil))
+  (let* ((changed (flavor-changed flavor))
+	 (req-inits (changed-required-inits changed))
+	 (plist (changed-default-plist changed))
+	 (keywords (changed-init-keywords changed)))
+    (when (or req-inits plist keywords)
+      (let ((new-req-inits nil) (newplist nil) (newkeywords nil))
+	(dolist (c all-components)
+	  (when req-inits
+	    (dolist (req-init (flavor-required-inits c))
+	      (pushnew req-init new-req-inits)))
+	  (when plist
+	    (do ((list (flavor-default-plist c) (cddr list)))
+		((endp (cdr list)))
+	      (when (eq 'foo (getf newplist (car list) 'foo))
+		(push (cadr list) newplist)
+		(push (car list) newplist))))
+	  (when keywords
+	    (dolist (key (flavor-init-keywords c))
+	      (pushnew key newkeywords))))
+	(when req-inits
+	  (setf (flavor-required-inits* flavor) new-req-inits
+		(changed-required-inits (flavor-changed flavor)) nil))
+	(when plist (setf (flavor-default-plist* flavor) newplist
+			  (changed-default-plist (flavor-changed flavor)) nil))
+	(when keywords
+	  (setf (flavor-init-keywords* flavor) newkeywords
+		(changed-init-keywords (flavor-changed flavor)) nil))))))
+
+;;;
+;;; The interface routines.
+;;;
+
+
+;;; We try to clean up the components first so we can inherit their
+;;; combined methods.  This works in all cases but where a loop
+;;; is present in the structure, so we have to test whether we can inherit
+;;; or not.
+;;;
+;;; We traverse the tree of components, keeping track of the current
+;;; path in touched (thus preventing loops), and ignoring when we
+;;; hit the current path again. 
+
+(defun order-flavors (stack result-stack)
+  (with-stacks (touched)
+    (macrolet ((touch (f)
+		 `(cond ((find ,f touched))
+			((find ,f result-stack))
+			(t (touch-components ,f)))))
+      (labels ((touch-components (f)
+		 (catch 'out
+		   (vector-push-extend f touched)
+		   (let ((*undefined-components*
+			  #'(lambda (f c)
+			      (format *error-output*
+				      "Flavor ~S has undefined components ~S."
+				      (flavor-name f) c)
+			      (vector-pop touched)
+			      (throw 'out nil))))
+		     (dolist (c (flavor-all-components f)) (touch c)))
+		   (when (find f stack) (vector-push-extend f result-stack))
+		   (vector-pop touched))))
+	(dotimes (i (length stack))
+	  (let ((thing (ARef stack i)))
+	    (touch thing)))))))
+-------
+

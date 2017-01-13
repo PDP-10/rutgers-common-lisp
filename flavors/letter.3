@@ -1,0 +1,1097 @@
+Received: by kuling.UUCP; Sun, 16 Jun 85 11:34:49 -0200
+Received: by enea.UUCP; Sun, 16 Jun 85 08:24:19 -0200
+Received: by mcvax.UUCP; Sun, 16 Jun 85 06:57:53 -0200 (MET)
+Received: from CMU-CS-C.ARPA by seismo.ARPA with SMTP; Sat, 15 Jun 85 22:00:18 EDT
+Message-Id: <8506160200.AA11961@seismo.ARPA>
+Received: ID <HANDERSON@CMU-CS-C.ARPA>; Sat 15 Jun 85 21:59:45-EDT
+Date: Sat 15 Jun 85 21:59:43-EDT
+From: enea!mcvax!seismo!CMU-CS-C.ARPA!Steven.Handerson
+Subject: Flavors, cntd
+To: enea!kuling!victor
+
+
+(defun cleanup-all-flavors ()
+  "Optimizes the cleaning of dirty flavors, allowing effective sharing
+  of combined methods."
+  (with-stacks (ordered)
+    (order-flavors *dirty-flavors* ordered)
+    (dotimes (i (length ordered))
+      (cleanup-flavor (Aref ordered i)))))
+
+
+(defun cleanup-flavor (flavor)
+  "Cleans the flavor."
+  (when (symbolp flavor) (Setq flavor (get-flavor flavor)))  
+  (let ((*uninstantiable* #'dissociate-instances)
+	(*inheritablep* #'message-clean-p)
+	(*definer* #'(lambda (name form)
+		       (declare (ignore name))
+		       (if *flavor-compile-methods*
+			   (funcall (compile nil `(lambda () ,form)))
+			   (eval form))))	       
+	(*set-handlers* #'flavor-set-handlers))
+    (internal-cleanup-flavor flavor t)))
+
+;;; Propogates methods-need-work and then cleans up.
+;;; Does nil message and do-dependents t mean all of everybody's methods,
+;;; or just those inherited from the original?
+
+(Defun recompile-flavor (flavor-name &optional message (do-dependents t))
+  "Use this when something compiled into a combined method has changed,
+  for instance a macro used by a wrapper and hence compiled into the 
+  combined method."
+  (let ((flavor (get-flavor flavor-name))
+	(*uninstantiable* #'dissociate-instances)
+	(*inheritablep* #'message-clean-p)
+	(*definer* #'(lambda (name form)
+		       (declare (ignore name))
+		       (if *flavor-compile-methods*
+			   (funcall (compile nil `(lambda () ,form)))
+			   (eval form))))	       
+	(*set-handlers* #'flavor-set-handlers))
+    (cond (do-dependents
+	   (with-stacks (flavors ordered)
+	     (do-inheriting-flavors (flavor flavor flavors)
+	       (rework-flavor flavor)
+	       (if (null message)
+		   (setf (changed-all-methods (flavor-changed flavor)) t)
+		   (rework-methods flavor message)))
+	     (order-flavors flavors ordered)
+	     (dovec (o ordered) (internal-cleanup-flavor o))))
+	  ((null message)
+	   (rework-flavor flavor)
+	   (setf (changed-all-methods (flavor-changed flavor)) t)
+	   (internal-cleanup-flavor flavor))
+	  (t (rework-flavor flavor)
+	     (rework-methods flavor message)
+	     (internal-cleanup-flavor flavor)))))
+
+(defun compile-flavor (flavor &optional (*flavor-compile-methods*
+					 *flavor-compile-methods*))
+  "Makes a non-abstract flavor ready for instantiation, and an abstract
+  flavor sharable with respect to combined methods.  If you're doing this
+  for a file, use compiler-compile-flavors instead."
+  (let ((*flavors-compile* t))
+    (cleanup-flavor flavor)))
+
+(defmacro compiler-compile-flavors (&rest flavor-names)
+  "Just like compile-flavors, only it includes the definitions of all
+  combined methods - compile-flavors doesn't redefine methods it can
+  find in the runtime environment.  This way, you're guaranteed to have
+  all the functions you expect when you load the file.
+  Uses the cleanup machinery, so it cleans up affected flavors first."
+
+  (with-stacks (stack ordered defined-methods)
+    (dolist (f flavor-names) (vector-push-extend (get-flavor f) stack))
+    (order-flavors stack ordered)
+    (dotimes (i (length ordered))
+      (cleanup-flavor (aref ordered i)))
+    (Setf (fill-pointer ordered) 0) 
+    (dolist (name flavor-names)
+      (let ((flavor (get-flavor name)))
+	(setf (changed-all-methods (flavor-changed flavor)) t)))
+    (let* ((forms nil)
+	   (*uninstantiable* #'dissociate-instances)
+	   (*inheritablep*
+	    #'(lambda (flavor message)
+		(cond ((member (flavor-name flavor) flavor-names) t)
+		      ((message-clean-p flavor message) :redefine)
+		      (t nil))))
+	   (*definer* #'(lambda (name form)
+			  (unless (find name defined-methods)
+			    (push form forms)
+			    (vector-push-extend name defined-methods))))
+	   (*set-handlers*
+	    #'(lambda (flavor name-stack fn-stack all-p)
+		(declare (ignore all-p))
+		(push `(flavor-set-handlers (get-flavor ',(flavor-name flavor))
+			 ',(copy-seq name-stack) ',(copy-seq fn-stack) t)
+		      forms)))
+	   (*flavors-compile* t))
+      (order-flavors stack ordered)
+      (dotimes (i (length ordered))
+	(internal-cleanup-flavor (aref ordered i) t))
+      `(progn (eval-when (load)
+		(let ((*dont-do-methods* t))
+		  (mapc #'compile-flavor ',flavor-names)))
+	      (eval-when (compile load)
+		,@(nreverse forms))))))
+
+
+;;;
+;;; Combination stuff.
+;;;
+
+;;; These macros refer to the specials of the previous section.
+
+(eval-when (compile eval load)
+  (defmacro get-slot (Message slot)
+    `(my-assoc ,message (my-assoc ,slot *methods*))))
+
+(defun method-list (slot-name)
+  "Takes the slot-name given in order-methods.  Returns the list of
+  method-function-names resulting from the ordering.  For a :primary
+  ordered slot, this will be a list of one function."
+  (get-slot *message* slot-name))
+
+(defun call-methods (slot-name-or-list)
+  "Takes either a slot-name or a list of method function names.  Returns a list
+  of forms that call them."
+  (mapcar #'(lambda (x) `(method-apply ,x %combined-args))
+	  (if (listp slot-name-or-list) slot-name-or-list
+	      (get-slot *message* slot-name-or-list))))
+
+(defun wrapper-mix (slot-name-or-list form)
+  "Wraps the form with the wrappers (and whoppers) of the given types. 
+  (See defwrapper, defwhopper.)  The ordering of the wrapper functions
+  is the reverse of the order in which the wrappings will be encountered
+  at runtime."
+  (let ((list (if (atom slot-name-or-list) (get-slot *message* slot-name-or-list)
+		  slot-name-or-list)))
+    (dolist (l list)
+      (setq form (funcall l form)))
+    form))
+
+
+(defmacro defcombination-ordering (name (arg) &body body)
+  "(name (ordering-arg) &body body)
+  Should use ORDER-METHODS or ORDER-WRAPPERS (almost exclusively) to
+  order the method types of a method into named slots.
+  Keep in mind that the code may be executed many times, depending upon the
+  implementation."
+  `(defun ,name (,arg type-assoc &optional reverse-and-describe)
+     (dolist (cons (if reverse-and-describe '((foo . bar)) type-assoc))
+       (let ((type (car cons))
+	     (method (cdr cons)))
+	 ,@body))))
+
+(defmacro order-methods (order slot types)
+  "(order slot types)
+  Slot and types are evaled.  Slot-name is the name used in message-list, etc.
+  Order is one of :base-flavor-last, :primary, or :base-flavor-first,
+  as described in the documentation.  The method-types in the list are added
+  in order to the list of methods in the slot."
+  (case order
+    (:primary `(if reverse-and-describe
+		   (let ((thing (car (get-slot *message* ,slot))))
+		     (unless (find thing *called-methods*)
+		       (vector-push-extend thing *called-methods*)))
+		   (when (member type ,types)
+		     (unless (get-slot *message* ,slot)
+		       (push method (get-slot *message* ,slot))))))
+    (:base-flavor-first `(if reverse-and-describe
+			     (dolist (m (get-slot *message* ,slot))
+			       (unless (find m *called-methods*)
+				 (vector-push-extend m *called-methods*)))
+			     (when (member type ,types)
+			       (push method (get-slot *message* ,slot)))))
+    (:base-flavor-last `(if reverse-and-describe
+			    (dolist (m (nreversef (get-slot *message* ,slot)))
+			      (unless (find m *called-methods*)
+				(vector-push-extend m *called-methods*)))
+			    (when (member type ,types)
+			      (push method (get-slot *message* ,slot)))))))
+
+(defmacro order-wrappers (order slot types)
+  "Just like order-methods, except remembers the list of wrapper functions
+  along with the list of methods."
+  `(cond (reverse-and-describe
+	  ,(if (eq order :base-flavor-last)
+	       `(nreversef (get-slot *message* ,slot)))
+	  (vector-push-extend (get-slot *message* ,slot) *description*))
+	 (t (order-methods ,order ,slot ,types))))
+
+
+(defmacro defcombination (name ordering-fn (order-arg) &body body)
+  "(name ((order-arg) ordering-fn) &body mixing-body)
+  The order-arg is bound to the argument of the combination name.
+  the ordering-fn is used to order the methods of the method we're combining
+  (see defcombination-ordering).  The body of this form should produce
+  the actual combined method, using the functions METHOD-LIST, CALL-METHODS,
+  CALL-METHOD, AND WRAPPER-MIX to access the slots of the ordered methods.
+  The system will optimize only bare method-calls, not those surrounded
+  by AND, etc."
+  `(make-combination ',name ',ordering-fn
+		     #'(lambda (,order-arg) ,order-arg ,@body)))
+
+;;;
+;;; Random user-level functions
+;;;
+
+(defun symeval-in-instance (instance symbol &optional no-error-p)
+  "If no-error-p is non-nil, unbound ivs will not signal an error.
+  Ivs not present in the environment will signal an error in either case."
+  (let* ((vec (iv-env-vector (instance-descriptor-env
+			      (instance-descriptor instance))))
+	 (pos (position symbol vec)))
+    (cond ((null pos)
+	   (error "Instance variable ~S not found in instance ~S."
+		  symbol instance))
+	  ((iv-unbound-p instance pos)
+	   (if no-error-p nil
+	       (error "Instance variable ~S unbound." symbol)))
+	  (t (instance-ref instance pos)))))
+
+(defun set-in-instance (instance symbol value)
+  "An error is signalled if the symbol is not an instance variable in the given
+  instance."
+  (let* ((vec (iv-env-vector (instance-descriptor-env
+			      (instance-descriptor instance))))
+	 (pos (position symbol vec)))
+    (cond ((null pos)
+	   (error "Instance variable ~S not found in instance ~S."
+		  symbol instance))
+	  (t (setf (instance-ref instance pos) value)))))
+
+(defun get-handler-for (object message)
+  "Returns the function that handles the given message."
+  (get-handler message object)) 
+
+(defmacro lexpr-funcall-self (message &rest arguments)
+  "Supplied for compatibility with Symbolics Flavors."
+  `(apply #'send self ,message ,@arguments))
+
+(defmacro funcall-self (message &rest arguments)
+  "Supplied for compatibility with Symbolics Flavors."
+  `(send self ,message ,@arguments))
+
+(Defun flavor-allowed-init-keywords (flavor-name)
+  "Returns a list of the allowable init-keywords for the flavor."
+  (let ((flavor (get-flavor flavor-name))
+	(res nil))
+    (dolist (flav (flavor-all-components flavor))
+      (setf res (append (flavor-init-keywords flav) res)))
+    (sort res #'string-lessp :key #'symbol-name)))
+
+(defun flavor-allows-init-keyword-p (flavor-name keyword)
+  "Returns the flavor that provides this init option, or NIL if none."
+  (let ((flavor (get-flavor flavor-name)))
+    (dolist (flav (flavor-all-components flavor))
+      (if (find keyword (flavor-init-keywords (flavor-method-env flav)))
+	  (return-from flavor-allows-init-keyword-p flavor-name)))))
+
+(defun make-instance (flavor-name &rest init-plist)
+  "Compiles the flavor and makes sure it's initable, inits any initable
+  instance variables from the init-plist and inits others if inits given,
+  then sends :INIT with the plist if it's handled.  Returns the new instance."
+  (typecase init-plist
+    (list)
+    (symbol (setq init-plist (symbol-plist init-plist)))
+    (t (error "Init-plist not list or symbol - ~S." init-plist)))
+  (let* ((flavor (get-flavor flavor-name)))
+    (when (flavor-abstract-p flavor)
+      (error "Attempt to instantiate an abstract flavor: ~S." flavor-name))
+    (let ((*flavors-compile* t))
+      (cleanup-flavor (get-flavor flavor-name)))
+    (with-stacks (unused-properties used-properties)
+      (let* ((desc (flavor-descriptor flavor))
+	     (self (instantiate-instance-descriptor desc))
+	     (new-plist nil))
+	;; Scan the init-plist for variable inits.  If it's not a variable
+	;; init, make sure it's in the allowed-keywords sequence.
+	(do ((plist init-plist (cddr plist)))
+	    ((endp plist))
+	  (if (plusp (length unused-properties))
+	      (if (not (find (car plist) (flavor-init-keywords* flavor)))
+		  (vector-push-extend (car plist) unused-properties))
+	      (let ((iv (cdr (assoc (car plist) (flavor-iv-keywords* flavor)))))
+		(cond (iv (when (iv-unbound-p self iv)
+			    (setf (instance-ref self iv) (cadr plist))
+			    (vector-push-extend (car plist) used-properties)))
+		      ((find (car plist) (flavor-init-keywords* flavor))
+		       (when (eq 'frob (getf new-plist (car plist) 'frob))
+			 (vector-push-extend (car plist) used-properties)
+			 (push (eval (cadr plist)) new-plist)
+			 (push (car plist) new-plist)))
+		      (t (vector-push-extend (car plist) unused-properties))))))
+	(do ((plist (flavor-default-plist* flavor) (cddr plist)))
+	    ((endp plist))
+	  (if (plusp (length unused-properties))
+	      (if (not (find (car plist) (flavor-init-keywords* flavor)))
+		  (vector-push-extend (car plist) unused-properties))	      
+	      (let ((iv (position (car plist) (flavor-iv-keywords* flavor))))
+		(cond (iv (when (iv-unbound-p self iv)
+			    (setf (instance-ref self iv) (EVAL (cadr plist)))
+			    (vector-push-extend (Car plist) used-properties)))
+		      ((find (car plist) (Flavor-init-keywords* flavor))
+		       (when (eq 'frob (getf new-plist (Car plist) 'frob))
+			 (push (cadr plist) new-plist)
+			 (push (car plist) new-plist)
+			 (vector-push-extend (car plist) used-properties)))
+		      (t (vector-push-extend (car plist) unused-properties))))))
+	(if (plusp (length unused-properties))
+	    (error "Unknown init keywords for make-instance: ~S."
+		   (coerce unused-properties 'list)))
+	;; Init the ivs not bound.
+	(send self 'INTERNAL-INIT)
+	;; @#@# Maybe could remove the keywords supplied in the default
+	;; list from the list of required ones.
+	(let (required)
+	  (dolist (req (flavor-required-inits* flavor))
+	    (unless (find req used-properties)
+	      (push req required)))
+	  (if required (error "Additional required keywords for flavor ~S: ~S."
+			      flavor-name required)))
+	(send self :send-if-handles :init new-plist)
+	self))))
+
+
+(defun undefflavor (name)
+  "Permanently dissociates the flavor's instances and undefines the flavor."
+  (let ((flavor (get-flavor name)))
+    (when (flavor-defined-p flavor)
+      (with-stacks (affected)
+	(do-inheriting-flavors (i flavor affected)
+	  (rework-flavor i)
+	  (setf (changed-components (flavor-changed i)) t))
+	(dissociate-instances flavor "Flavor has been undefflavored.")
+	(setf (flavor-methods flavor) (make-method-structure)
+	      (flavor-descriptor flavor) nil
+	      (flavor-compiled-p flavor) nil
+	      (flavor-defined-p flavor) nil)
+	(deletef name *all-flavor-names*)
+	(dolist (c (flavor-components flavor))
+	  (deletef name (flavor-dependents (get-flavor c))))
+	(with-stacks (ordered)
+	  (order-flavors affected ordered)
+	  (dotimes (i (length ordered))
+	    (cleanup-flavor (ARef ordered i))))))
+    name))
+
+(Defmacro undefmethod ((flavor type &optional (message nil mp)))
+  "(flavor [type] message)
+  Undoes the effect of the corresponding defmethod, defwrapper (use type :wrapper)
+  , or whopper (type :whopper)."
+  (if (not mp) (setq message type type :primary))
+  `(%undefmethod ',flavor ',message ',type))
+(defun %undefmethod (flavor-name message type)
+  (let ((flavor (get-flavor flavor-name)))
+    (deletef type (method-types message (Flavor-methods flavor))
+	     :key #'car)
+    (recompile-flavor (flavor-name flavor) message))
+  message)
+
+;;; Defines a function that takes the argument name and a a rest arg of the
+;;; body, and that does the transformation for that wrapper, returning the 
+;;; new form.
+
+(defmacro defwrapper ((flavor type &optional (method nil mp))
+		      (args . passed-body) &body body)
+  ;;
+  "((flavor [type] method) (args . passed-body) &body body)
+  Wrappers are sort of like macros, getting expanded into the combined method
+  for flavors that inherit it.  The args is either ignore or a list that
+  is destructure-bound at send-time to the method's argument-list.  The
+  passed-body gets bound at 'expansion time' to the 'inside' of the wrapper."
+  ;;
+  (if (not mp) (setq method type type :wrapper))
+  (if (eq args 'ignore) (Setq args nil))
+  (let* ((name (flavor-function-name flavor method type))
+	 (new-defun `(defun ,name (&rest ,passed-body)
+		       (let ((form (progn ,@body)))
+			 `(mydlet ((,',args %combined-args))
+			    ,form)))))
+    `(progn
+      (eval-when (compile eval load)
+	,new-defun)
+      (eval-when (compile eval)
+	(let ((new-defun ',new-defun)
+	      (old-defun (get ',name 'old-defun))
+	      (new-hash nil))
+	  (when (or (and (null old-defun)
+			 (let ((hash (get ',name 'sxhash)))
+			   (or (null hash)
+			       (not (= hash (setq new-hash (sxhash new-defun)))))))
+		    (not (equal new-defun old-defun)))
+	    (method-add ',method ',type ',name
+			(flavor-methods (get-flavor ',flavor)))
+	    (recompile-flavor ',flavor ',method)
+	    (setf (get ',name 'old-defun) new-defun)
+	    (if new-hash
+		(setf (get ',name 'sxhash) new-hash)))))
+      (eval-when (load)
+	(let ((hash (Get ',name 'sxhash))
+	      (new (sxhash ,new-defun)))
+	  (when (or (null hash) (not (= hash new)))
+	    (method-add ',method ',type ',name
+			(flavor-methods (get-flavor ',flavor)))
+	    (recompile-flavor ',flavor ',method)
+	    (setf (Get ',name 'sxhash) new))))
+      ',method)))
+
+
+(defmacro defmethod ((flavor-name type &optional (method nil methodp))
+		     args &body forms)
+  ;;
+  "((flavor-name [type] method) args &body body)
+  Refer to the flavor documentation for details."
+  ;;
+  (if (not methodp) (psetq method type type :primary))
+  (let ((flavor (get-flavor flavor-name))
+	(function-name (flavor-function-name flavor-name method type)))
+    (unless (flavor-defined-p flavor)
+      (error "Flavor ~S not defined." flavor-name))
+    (multiple-value-bind (docs forms) (extract-doc-and-declares forms)
+      `(eval-when (eval load compile)
+	 (internal-define-method ,function-name ,(flavor-method-env flavor)
+				 ,args (,@docs (block ,method ,@forms)))
+	 (%defmethod ',flavor-name ',method ',type ',function-name)))))
+(defun %defmethod (flavor-name method type function-name)
+  (if (method-add method type function-name
+		  (flavor-methods (get-flavor flavor-name)))
+      (recompile-flavor flavor-name method))
+  method)
+
+
+;;; The continuation is a lambda closed in the instance environment.
+;;; The type used in the defwhopper is the type of the wrapper (default :whopper).
+;;; The whopper itself is a method of the flavor - it (and hence the name)
+;;; depends upon the flavor it's defined for, the method and type.
+;;; (so that all inheriting flavors have it).
+
+(defmacro defwhopper ((name &rest method-and-type) args &body body)
+  "((flavor [type] method) args &body body)
+  Whoppers are to wrappers what functions are to macros.  Whoppers
+  are functions that call continue-whopper, lexpr-continue-whopper,
+  or continue-whopper-all with the desired arguments to continue with the
+  wrapped code."
+  (setq method-and-type (nreverse method-and-type))
+  (let* ((method (pop method-and-type))
+	 (type (or (pop method-and-type) :whopper))
+	 (whopper-method (flavor-function-name name method type "WHOPPER")))
+    `(progn (defmethod (,name ,whopper-method)
+		       (%continuation %combined-args ,@args)
+	      ,@body)
+	    (defwrapper (,name ,type ,method) (nil . wrapper-body)
+	      `(apply #'send self ',',whopper-method
+		      #'(lambda (%arglist &rest %combined-args)
+			  (if (listp %arglist) (setq %combined-args %arglist))
+			  ,@wrapper-body)
+		      %combined-args
+		      %combined-args)))))
+
+(defmacro continue-whopper-all ()
+  "See defwhopper.  Continues the combined method with all the passed arguments
+  (efficiently)."
+  `(funcall %continuation %combined-args))
+(defmacro continue-whopper (&rest args)
+  "See defwhopper and continue-whopper-all.  Continue-whopper lets you continue
+  the combined method with different arguments."
+  `(funcall %continuation t ,@args))
+(defmacro lexpr-continue-whopper (&rest args)
+  "See defwhopper."
+  `(apply %continuation t ,@args))
+
+______________________________________________________________________
+vanilla.slisp
+
+;;; -*- Mode: lisp; Package: flavors -*-
+;;;
+
+(in-package 'flavors)
+
+(defcombination-ordering daemon-ordering-primary (order)
+  (order-wrappers :base-flavor-first 'wrappers '(:wrapper :whopper))
+  (order-methods :primary 'primary '(:primary))
+  (order-methods :primary 'default '(:default))
+  (case order
+    (:base-flavor-last
+     (order-methods :base-flavor-last 'befores '(:before))
+     (order-methods :base-flavor-first 'afters '(:after)))
+    (:base-flavor-first
+     (order-methods :base-flavor-first 'befores '(:before))
+     (order-methods :base-flavor-last 'afters '(:after)))
+    (t (error "Unknown ordering ~S." order))))
+
+(defcombination-ordering daemon-ordering-list (order)
+  (order-wrappers :base-flavor-first 'wrappers '(:wrapper :whopper))
+  (case order
+    (:base-flavor-last
+     (order-methods :base-flavor-last 'primary '(:primary))
+     (order-methods :base-flavor-last 'default '(:default))
+     (order-methods :base-flavor-last 'befores '(:before))
+     (order-methods :base-flavor-first 'afters '(:after)))
+    (:base-flavor-first
+     (order-methods :base-flavor-first 'primary '(:primary))
+     (order-methods :base-flavor-first 'default '(:default))
+     (order-methods :base-flavor-first 'befores '(:before))
+     (order-methods :base-flavor-last 'afters '(:after)))
+    (t (error "Unknown ordering ~S." order))))
+
+(defcombination :daemon daemon-ordering-primary (arg)
+  (let ((primary (or (method-list 'primary) (method-list 'default))))
+    (wrapper-mix 'wrappers
+      (cond ((and (null (method-list 'befores)) (null (method-list 'afters)))
+	     (car (call-methods 'primary)))
+	    (t `(progn ,@(call-methods 'befores)
+		       (multiple-value-prog1
+			,.(call-methods primary)
+			,@(call-methods 'afters))))))))
+
+(defcombination :progn daemon-ordering-list (arg)
+  (wrapper-mix 'wrappers
+    `(progn ,@(call-methods 'befores)
+	    (multiple-value-prog1
+	     (progn ,@(call-methods (or (method-list 'primary)
+					(method-list 'default))))
+	     ,@(call-methods 'afters)))))
+
+(Defflavor vanilla-flavor () ())
+
+(defmethod (vanilla-flavor print) (stream depth)
+  (send self :print-self stream depth))
+
+(Defmethod (vanilla-flavor describe) ()
+  (send self :describe))
+
+(DEfmethod (vanilla-flavor typep) (type)
+  (let ((flavor (get type 'flavor)))
+    (and flavor
+	 (not (null (member flavor
+			    (flavor-all-components
+			     (get-flavor
+			      (instance-descriptor-type
+			       (instance-descriptor self))))))))))
+
+(defmethod (vanilla-flavor :print-self) (stream depth)
+  (declare (ignore depth))
+  (format stream "#<~A ~A>"
+	  (instance-descriptor-type (instance-descriptor  self))
+	  "?"))
+
+(defmethod (vanilla-flavor :describe) ()
+  (let* ((name (instance-descriptor-type (instance-descriptor self)))
+	 (vec (iv-env-vector (flavor-instance-env (get-flavor name)))))
+    (format t "~%An instance of flavor ~S." name)
+    (cond ((zerop (length vec))
+	   (format t "~%No instance variables."))
+	  (t (format t "~%Instance variables:")))
+    (dotimes (i (length vec))
+      (format t "~%~S ~S" (aref vec i)
+	      (if (iv-unbound-p self i) 'unbound (instance-ref self i))))))
+
+(defmethod (vanilla-flavor :which-operations) ()
+  (let ((list nil))
+    (do-handlers ((name function)
+		  (flavor-descriptor
+		   (get-flavor
+		    (instance-descriptor-type
+		     (instance-descriptor self)))))
+      (declare (ignore function))
+      (push name list))
+    list))
+
+(defmethod (vanilla-flavor :operation-handled-p) (operation)
+  (not (null (get-handler operation (instance-descriptor self)))))
+
+(defmethod (vanilla-flavor :send-if-handles) (operation &rest arguments)
+  (when (get-handler operation (instance-descriptor self))
+    (apply #'send self operation arguments)))
+
+______________________________________________________________________
+Differences.mss
+
+@make(manual)
+@modify(programexample,free on)
+@style(singlesided)
+@begin(titlepage)
+@titlebox{@majorheading(Spice Lisp Flavors)}
+@copyrightnotice{
+Written by Steven Handerson and Jim Muller as part of the Spice Lisp project.
+}
+@end(titlepage)
+
+@chapter(Introduction)
+Spice Lisp Flavors was written based on a textual description of version 5.0
+Zetalisp.  Various modifications have been made to convert Flavors into Common
+Lisp, but hopefully code that does not depend on other features of Zetalisp
+(such as the window system) will work in Slisp Flavors.
+
+@subheading(Basic Operation)
+@index(Cleanup)@index(Dirty Flavors)
+Spice Lisp Flavors was deisgned to never lose state.  Any change that affects
+other flavors first propogates notice of the change to all the affected
+flavors, the "dirty" flavors.  The change is them made, and then a general
+"cleanup" procedure is invoked that updates all the dirty flavors.
+
+This has a few important implications.  One useful result is that it's quite
+simple to make efficient changes to large Flavors structures; all you have to
+do is inhibit cleanup until the changes are finished.  However, various
+operations (such as using compiler-compile-flavors) use the cleanup machinery
+in order to function, and so must clean up before continuing.
+
+@index(Wrappers)@index(Recompile-flavor)
+
+Slisp Flavors also follows version 5.0 in making recompilation due to wrapper
+redefinition automatic.  It does this generally by storing the sxhash of the
+wrapper code, and comparing this to the sxhash of the new defwrapper.
+@foot(Actually, in interpreted interactions the code is compared with equal
+since that's faster, but wrapper code loaded from compiled files only includes
+the sxhash).
+This will probably detect a change in virtually all of the cases; however, it
+is conceivable that the user might enter a different wrapper that hashes to the
+same value.  In this case, he will probably have to detect this himself, and
+use @t(recompile-flavor) to recalculate the combined method.
+
+
+@chapter(Additions to Slisp Flavors)
+
+Wrappers and whoppers, in addition to normal methods, can have any type.
+However, you must make your own method combinations in order to make use of this.
+
+@begin(description)
+@t(*undefined-flavor-names*)@index(*undefined-flavor-names*)@>[Variable]@*
+A list of referred-to but not yet defflavored flavors.
+
+@t(*flavor-compile-methods*)@index(*flavor-compile-methods*)@>[Variable]@*
+If this is T, newly calculated combined methods are automatically compiled.
+Our machine and compiler just isn't as fast as for a 3600.
+
+@t(*dirty-flavors*)@index(*dirty-flavors*)@>[Variable]@*
+Holds an array of the dirty flavors.  Please don't alter.
+
+@t(cleanup-all-flavors)@index(Cleanup-all-flavors)@>[Function]@*
+If you interrupt a change in progress, you can use this to finish it.
+
+@t(without-cleaning-flavors) &rest @i(forms)@>[Function]@* 
+This executes the @i(forms), but recompilation and updating of flavors that
+the execution of the @i(forms) may cause is done @i(after) executing them
+all.  This is useful if you want to change a bunch of flavors that affect the
+same combined methods.
+
+@t(continue-whopper-all)@index(continue-whopper-all)@>[Macro]@*
+This form, when executed in a whopper definition, causes the combined method to
+be continued with all the arguments received by the whopper.  This form exists
+because Common Lisp doesn't have stack &rest args, and we might save a lot of
+consing here.
+
+@end(description)
+
+
+@chapter(Differences between Symbolics and Slisp Flavors)
+
+@begin(itemize)
+There is no variant form of defmethod (that takes a function name).
+This could be done easily, but it would probably do an extra function
+call.
+
+@index(mixtures)@index(flavor-default-init-putprop, etc.)
+Mixtures, and @t(flavor-default-init-putprop), etc.
+are not yet implemented.
+
+Instances cannot be funcalled.  If they are, it should probably be 
+object-specific; i.e., funcalling an object sends a 'funcall message to the
+object with the arguments.  
+
+@index(instantiate-flavor)@index(defun-method)@index(defselect-method)
+@index(declare-flavor-instance-variables)@index(locate-in-instance)
+@index(describe-flavor)@index(*flavor-compilations* special)
+@index(*flavor-compile-trace* special)@index(:method-order flavor option)
+@index(:special-instance-variables flavor option)
+The following things will probably never be implemented:
+@t(instantiate-flavor, defun-method, defselect-method
+declare-flavor-instance-variables, locate-in-instance, describe-flavor)
+forms; @t(*flavor-compilations* and *flavor-compile-trace*) specials; and 
+@t(:special-instance-variables and :default-handler) flavor options.
+[To make a default handler, handle :unclaimed-message.]
+
+In the Symbolics implementation, any method having a type not used by the
+method combination defined for that method signals an error.  This is currently
+not done in Slisp Flavors.
+@end(itemize)
+@begin(description)
+
+@index(continue-whopper)
+@t(Continue-whopper) @b(&rest) @i(args) @>[Macro]@*
+
+@index(lexpr-continue-whopper)
+@t(Lexpr-continue-whopper) @b(&rest) @i(args) @>[Macro]@*
+These are macros in Slisp Flavors, so that the continuation can be called with
+extra implementation-dependent arguments.
+
+@index(recompile-flavor)
+@t(recompile-flavor) @i(message) @b(&optional) (@i(do-dependents) @b(t)) @>[Function] @*
+@i(Message) can be either @b(nil) for all messages, a single message name, or a
+list of message names.  Note that the arguments are different.
+
+@index(compile-flavor)@index(compiler-compile-flavors)
+@t(compile-flavor) @i(flavor) @>[Function]@*
+For use in the interpreter only.  To do the right thing in compiled files,
+use compiler-compile-flavors, below.  These are two forms because I couldn't 
+think of a way to tell whether one was in the compiler or not.
+
+@index(compiler-compile-flavors)
+@t(compiler-compile-flavors) @b(&rest) @i(flavors) @>[Macro]@* 
+This is different in a couple of ways from compile-flavor of all of the named
+flavors.  @t(Compile-flavor) doesn't recompile anything it can find in the
+current environment; @t(compiler-compile-flavors) does, so that it will surely
+be there in the loadtime environment.  @t(Compiler-compile-flavors) therefore
+also makes sure that each combined methods calculated is only calculated once.
+
+@end(description)
+______________________________________________________________________
+Flavors.mss
+
+@make(manual)
+@modify(programexample,free on)
+@style(singlesided)
+@comment{
+
+Jim, 5/14/85 Changed to fit Handerson's Slisp flavors and compile in scribe.
+
+This is a new chapter for the LMMAN.  DLW 10/1/80
+
+I assume that this comes after the discussion of defstruct (chap 17) but
+before the discussion of streams (sect 18.5).}
+
+@begin(titlepage)
+@titlebox{@majorheading(Introduction to Flavors)}
+@copyrightnotice{
+This document is adapted from text written primarily by David Moon and
+Daniel Weinreb which appeared in the Lisp Machine Manual, fourth
+edition, chapter 20, copyrighted by the Massachusetts Institute of
+Technology.  We have used it with permission of the authors and MIT.
+}
+@end(titlepage)
+
+@index(instance)@index(object)@index(method)@index(message)@index(flavor)
+@chapter(Introduction)
+
+Object oriented programming is available in Common Lisp.
+Its purpose is to perform
+@i(generic operations) on objects.  Part of its implementation is
+simply a convention in procedure calling style; part is a powerful
+language feature, called Flavors, for defining abstract objects.
+This chapter attempts to explain what programming with objects and with
+message passing means, the various means of implementing these in
+Common Lisp, and when you should use them.  It assumes no prior
+knowledge of any other languages.
+
+@chapter(Objects)
+@index(object-oriented programming)
+
+When writing a program, it is often convenient to model what the program
+does in terms of @i(objects): conceptual entities that can be likened to
+real-world things.  Choosing what objects to provide in a program is
+very important to the proper organization of the program.  In an
+object-oriented design, specifying what objects exist is the first
+task in designing the system.  In a text editor, the objects might be
+"pieces of text", "pointers into text", and "display windows".  In an
+electrical design system, the objects might be "resistors",
+"capacitors", "transistors", "wires", and "display windows".  After
+specifying what objects there are, the next task of the design is to
+figure out what operations can be performed on each object.  In the text
+editor example, operations on "pieces of text" might include inserting
+text and deleting text; operations on "pointers into text" might include
+moving forward and backward; and operations on "display windows" might
+include redisplaying the window and changing with which "piece of text" the
+window is associated.
+
+In this model, we think of the program as being built around a set of
+objects, each of which has a set of operations that can be performed on
+it.  More rigorously, the program defines several @i(types) of object
+(the editor above has three types), and it can create many @i(instances)
+of each type (that is, there can be many pieces of text, many pointers
+into text, and many windows).  The program defines a
+set of types of object, and the operations that can be performed on
+any of the instances of each type.
+
+This should not be wholly unfamiliar to the reader.  Earlier in this
+manual, we saw a few examples of this kind of programming.  A simple
+example is disembodied property lists, and the functions @t(get),
+@t(putprop), and @t(remprop).  The disembodied property list is a type of
+object; you can instantiate one with @t((cons nil nil)) (that is, by
+evaluating this form you can create a new disembodied property list);
+there are three operations on the object, namely @t(get), @t(putprop),
+and @t(remprop).  Another example in the manual was the first example of
+the use of @t(defstruct), which was called a @t(ship).  @t(defstruct)
+automatically defined some operations on this object: the operations to
+access its elements.  We could define other functions that did useful
+things with @t(ship)s, such as computing their speed, angle of travel,
+momentum, or velocity, stopping them, moving them elsewhere, and so on.
+
+In both cases, we represent our conceptual object by one Lisp object.
+The Lisp object we use for the representation has @i(structure), and refers
+to other Lisp objects.  In the property list case, the Lisp object is a
+list with alternating indicators and values; in the @t(ship) case, the
+Lisp object is an array whose details are taken care of by
+@t(defstruct).  In both cases, we can say that the object keeps track of
+an @i(internal state), which can be @i(examined) and @i(altered) by the
+operations available for that type of object.  @t(get) examines the state
+of a property list, and @t(putprop) alters it; @t(ship-x-position)
+examines the state of a ship, and @t((setf (ship-mass) 5.0)) alters it.
+
+We have now seen the essence of object-oriented programming.  A
+conceptual object is modelled by a single Lisp object, which bundles up
+some state information.  For every type of object, there is a set of
+operations that can be performed to examine or alter the state of the
+object.
+
+@chapter(Modularity)
+@index(modularity)
+
+An important benefit of the object-oriented style is that it lends
+itself to a particularly simple and lucid kind of modularity.
+If you have modular programming constructs and techniques available,
+it helps and encourages you to write
+programs that are easy to read and understand, and so are more
+reliable and maintainable.  Object-oriented programming lets a
+programmer implement a useful facility that presents the caller with a set
+of external interfaces, without requiring the caller to understand how
+the internal details of the implementation work.  In other words, a program
+that calls this facility can treat the facility as a black box; the
+program knows what the facility's external interfaces guarantee to do,
+and that is all it knows.
+
+For example, a program that uses disembodied property lists never needs to
+know that the property list is being maintained as a list of alternating
+indicators and values; the program simply performs the operations, passing
+them inputs and getting back outputs.  The program only depends on the
+external definition of these operations: it knows that if it @t(putprop)s a
+property, and doesn't @t(remprop) it (or @t(putprop) over it), then it can
+do @t(get) and be sure of getting back the same thing it put in.  The
+important thing about this hiding of the details of the implementation is
+that someone reading a program that uses disembodied property lists need
+not concern himself with how they are implemented; he need only understand
+what they undertake to do.  This saves the programmer a lot of time, and
+lets him concentrate his energies on understanding the program he is
+working on.  Another good thing about this hiding is that the
+representation of property lists could be changed, and the program would
+continue to work.  For example, instead of a list of alternating elements,
+the property list could be implemented as an association list or a hash
+table.  Nothing in the calling program would change at all.
+
+The same is true of the @t(ship) example.  The caller is presented with
+a collection of operations, such as @t(ship-x-position),
+@t(ship-y-position), @t(ship-speed), and @t(ship-direction); it simply
+calls these and looks at their answers, without caring how they did what
+they did.  In our example above, @t(ship-x-position) and
+@t(ship-y-position) would be accessor functions, defined automatically
+by @t(defstruct), while @t(ship-speed) and @t(ship-direction) would be
+functions defined by the implementor of the @t(ship) type.  The code
+might look like this:
+
+@begin(programexample)
+(defstruct (ship)
+  ship-x-position
+  ship-y-position
+  ship-x-velocity
+  ship-y-velocity
+  ship-mass)
+
+(defun ship-speed (ship)
+  (sqrt (+ (^ (ship-x-velocity ship) 2)
+           (^ (ship-y-velocity ship) 2))))
+
+(defun ship-direction (ship)
+  (atan (ship-y-velocity ship)
+        (ship-x-velocity ship)))
+@end(programexample)
+
+The caller need not know that the first two functions were structure accessors
+and that the second two were written by hand and do arithmetic.  Those
+facts would not be considered part of the black box characteristics of
+the implementation of the @t(ship) type.  The @t(ship) type does not
+guarantee which functions will be implemented in which ways; such aspects
+are not part of the contract between @t(ship) and its callers.  In fact,
+@t(ship) could have been written this way instead:
+@begin(programexample)
+
+(defstruct (ship)
+  ship-x-position
+  ship-y-position
+  ship-speed
+  ship-direction
+  ship-mass)
+
+(defun ship-x-velocity (ship)
+  (* (ship-speed ship) (cos (ship-direction ship))))
+
+(defun ship-y-velocity (ship)
+  (* (ship-speed ship) (sin (ship-direction ship))))
+
+@end(programexample)
+In this second implementation of the @t(ship) type, we have decided to
+store the velocity in polar coordinates instead of rectangular
+coordinates.  This is purely an implementation decision; the caller has
+no idea which of the two ways the implementation works, because he just
+performs the operations on the object by calling the appropriate
+functions.
+
+We have now created our own types of objects, whose implementations are
+hidden from the programs that use them.  Such types are usually referred to as
+@i(abstract types).  The object-oriented style of programming can be
+used to create abstract types by hiding the implementation of the
+operations, and simply documenting what the operations are defined to do.
+
+Some more terminology: the quantities being held by the elements of the
+@t(ship) structure are referred to as @i(instance variables).  Each
+instance of a type has the same operations defined on it; what
+distinguishes one instance from another (besides identity (@t(eq)ness))
+is the values that reside in its instance variables.  The example above
+illustrates that a caller of operations does not know what the instance
+variables are; our two ways of writing the @t(ship) operations have
+different instance variables, but from the outside they have exactly the
+same operations.
+
+One might ask: "But what if the caller evaluates @t((aref ship 2)) and
+notices that he gets back the x-velocity rather than the speed?  Then he
+can tell which of the two implementations were used."  This is true; if
+the caller were to do that, he could tell.  However, when a facility is
+implemented in the object-oriented style, only certain functions are
+documented and advertised: the functions which are considered to be
+operations on the type of object.  The contract from @t(ship) to its
+callers only speaks about what happens if the caller calls these
+functions.  The contract makes no guarantees at all about what would
+happen if the caller were to start poking around on his own using
+@t(aref).  A caller who does so @i(is in error); he is depending on
+something that is not specified in the contract.  No guarantees were
+ever made about the results of such action, and so anything may happen;
+indeed, @t(ship) may get reimplemented overnight, and the code that does
+the @t(aref) will have a different effect entirely and probably stop
+working.  This example shows why the concept of a contract between a callee and
+a caller is important: the contract is what specifies the interface
+between the two modules.
+
+Unlike some other languages that provide abstract types, Common Lisp
+makes no attempt to have the language automatically forbid
+constructs that circumvent the contract.  This is intentional.  One
+reason for this is that Lisp is an interactive system, and
+so it is important to be able to examine and alter internal state
+interactively (usually from a debugger).  Furthermore, there is no
+strong distinction between the "system" programs and the "user" programs
+in Lisp; users are allowed to get into any part of the
+language system and change what they want to change.
+
+In summary: by defining a set of operations, and making only a
+specific set of external entrypoints available to the caller, the
+programmer can create his own abstract types.  These types can be useful
+facilities for other programs and programmers.  Since the implementation
+of the type is hidden from the callers, modularity is maintained, and
+the implementation can be changed easily.
+
+We have hidden the implementation of an abstract type by making its
+operations into functions which the user may call.  The important thing
+is not that they are functions--in Lisp everything is done with functions.
+The important thing is that we have defined a new conceptual operation
+and given it a name, rather than requiring anyone who wants to do the
+operation to write it out step-by-step.  Thus we say @t((ship-x-velocity s))
+rather than @t((aref s 2)).
+
+It is just as true of such abstract-operation functions as of ordinary
+functions that sometimes they are simple enough that we want the compiler
+to compile special code for them rather than really calling the function.
+(Compiling special code like this is often called @i(open-coding).)
+The compiler is directed to do this through use of macros, defsubsts, or
+optimizers.  @t(defstruct) arranges for this kind of special compilation
+for the functions that get the instance variables of a structure.
+
+When we use this optimization, the implementation of the abstract type
+is only hidden in a certain sense.  It does not appear in the Lisp code
+written by the user, but does appear in the compiled code.  The reason
+is that there may be some compiled functions that use the macros (or whatever);
+even if you change the definition of the macro, the existing compiled
+code will continue to use the old definition.  Thus, if
+the implementation of a module is changed programs that use it may need to be
+recompiled.  This is something we sometimes accept for the sake of
+efficiency.
+
+In the present implementation of flavors, which is discussed below, there is
+no such compiler incorporation of nonmodular knowledge into a
+program, except when the "outside-accessible instance variables"
+feature is used; see the section on the outside-accessible-instance-variables
+option, where this problem is explained further.  If you don't use the "outside-accessible instance
+variables" feature, you don't have to worry about this.
+
+@chapter(Generic Operations)
+@index(generic operations)
+
+Suppose we think about the rest of the program that uses the
+@t(ship) abstraction.  It may want to deal with other objects that are
+like @t(ship)s in that they are movable objects with mass, but unlike
+@t(ship)s in other ways.  A more advanced model of a ship might include
+the concept of the ship's engine power, the number of passengers on
+board, and its name.  An object representing a meteor probably would
+not have any of these, but might have another attribute such as how
+much iron is in it.
+
+However, all kinds of movable objects have positions, velocities, and
+masses, and the system will contain some programs that deal with these
+quantities in a uniform way, regardless of what kind of object the
+attributes apply to.  For example, a piece of the system that calculates
+every object's orbit in space need not worry about the other, more
+peripheral attributes of various types of objects; it works the same way
+for all objects.  Unfortunately, a program that tries to calculate the
+orbit of a ship will need to know the ship's attributes, and will have
+to call @t(ship-x-position) and @t(ship-y-velocity) and so on.  The problem is
+that these functions won't work for meteors.  There would have to be a
+second program to calculate orbits for meteors that would be exactly the
+same, except that where the first one calls @t(ship-x-position), the
+second one would call @t(meteor-x-position), and so on.  This would be
+very bad; a great deal of code would have to exist in multiple copies,
+all of it would have to be maintained in parallel, and it would take up
+space for no good reason.
+
+What is needed is an operation that can be performed on objects of
+several different types.  For each type, it should do the thing
+appropriate for that type.  Such operations are called @i(generic)
+operations.  The classic example of generic operations is the arithmetic
+functions in most programming languages, including Common Lisp.
+The @t(+) function will accept fixnums, flonums, ratios, bignums, etc.,
+and perform the appropriate type of addition based on the data types of
+the objects being manipulated.
+In our example, we need a generic @t(x-position) operation that can be
+performed on either @t(ship)s, @t(meteor)s, or any other kind of mobile
+object represented in the system.  This way, we can write a single
+program to calculate orbits.  When it wants to know the @i(x) position
+of the object it is dealing with, it simply invokes the generic
+@t(x-position) operation on the object, and whatever type of object it
+has, the correct operation is performed, and the @i(x) position is
+returned.
+
+A terminology for the use of such generic operations has emerged from
+the Smalltalk and Actor languages: performing a generic operation is
+called @i(sending a message).  The objects in the program are thought of
+as little people, who get sent messages and respond with answers.  In
+the example above, the objects are sent @t(x-position) messages, to
+which they respond with their @i(x) position.  This @i(message passing)
+is how generic operations are performed.
+
+Sending a message is a way of invoking a function.  Along with the
+@i(name) of the message, in general, some arguments are passed; when the
+object is done with the message, some values are returned.  The sender
+of the message is simply calling a function with some arguments, and
+getting some values back.  The interesting thing is that the caller did
+not specify the name of a procedure to call.  Instead, it specified a
+message name and an object; that is, it said what operation to
+perform, and what object to perform it on.  The function to invoke
+was found from this information.
+
+When a message is sent to an object, a function therefore must be found
+to handle the message.  The two data used to figure out which function
+to call are the @i(type) of the object, and the @i(name) of the message.
+The same set of functions are used for all instances of a given type, so
+the type is the only attribute of the object used to figure out which
+function to call.  The rest of the message besides the name are data
+which are passed as arguments to the function, so the name is the only
+part of the message used to find the function.  Such a function is
+called a @i(method).  For example, if we send an @t(x-position) message
+to an object of type @t(ship), then the function we find is "the
+@t(ship) type's @t(x-position) method".  A method is a function that
+handles a specific kind of message to a specific kind of object; this
+method handles messages named @t(x-position) to objects of type
+@t(ship).
+
+In our new terminology: the orbit-calculating program finds the @i(x)
+position of the object it is working on by sending that object a message
+named @t(x-position) (with no arguments).  The returned value of the
+message is the @i(x) position of the object.  If the object was of type
+@t(ship), then the @t(ship) type's @t(x-position) method was invoked; if
+it was of type @t(meteor), then the @t(meteor) type's @t(x-position)
+method was invoked.  The orbit-calculating program just sends the
+message, and the right function is invoked based on the type of the
+object.  We now have true generic functions, in the form of message
+passing: the same operation can mean different things depending on the
+type of the object.
+
+-------

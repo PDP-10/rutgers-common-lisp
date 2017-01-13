@@ -1,0 +1,9 @@
+;;; Compile Flavors files.
+(compile-file "Desc")
+(compile-file "F1")
+(compile-file "Kernel")
+(compile-file "KKernel")
+(compile-file "Setbit")
+(compile-file "Symmac")
+(compile-file "Tasty")
+(compile-file "Vanilla")

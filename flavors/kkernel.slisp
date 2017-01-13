@@ -1,0 +1,74 @@
+;;; KKERNEL.SLISP
+;;; The kernel-kernel allows object-oriented systems to share hooks.
+;;; Written by Steven Handerson.
+;;;
+
+(in-package "SYSTEM")
+
+(export '(send alloc-instance get-self %instance-ref instance-ref slot-unbound-p
+	       instance-descriptor instancep pointer-to-fixnum))
+
+
+(eval-when (eval load compile)
+  (defmacro pointer-to-fixnum (object)
+    #+spice `(%primitive make-immediate-type ,object 16)
+    #-spice "?"))
+
+#-lisp::kkernel
+(eval-when (compile eval load)
+  
+  ;; Test code.
+  #+spice
+  (eval-when (compile eval load)
+    (defsetf %instance-ref (instance slot) (new)
+      `(setf (aref (%instance-vector (get-self ,instance)) ,slot) ,new))
+    (defsetf instance-ref (instance slot) (new)
+      `(setf (aref (%instance-vector (get-self ,instance)) (1+ ,slot)) ,new)))
+  
+  (defstruct (%instance (:print-function internal-print-instance)
+			(:constructor internal-make-instance (vector))
+			(:predicate instancep))
+  vector)
+
+  (defun internal-print-instance (instance stream depth)
+    (send instance 'print stream depth))
+
+  (defmacro alloc-instance (size id &optional (initial-element ''unbound))
+    "Allocates a new instance."
+    `(let ((array (make-array (1+ ,size) :initial-element ,initial-element)))
+       (setf (aref array 0) ,id)
+       (internal-make-instance array)))
+
+  (defmacro %instance-ref (instance slot)
+    "Doesn't follow 'forwarding pointers'."
+    `(aref (%instance-vector ,instance) ,slot))
+
+  (defmacro instance-ref (instance slot)
+    "Follows 'forwarding pointers'."
+    `(aref (%instance-vector (get-self ,instance)) (1+ ,slot)))
+
+  (defmacro get-self (instance)
+    "Follows 'forwarding pointers' to get the REAL instance."
+    `(let* ((self ,instance))
+       (loop (let ((new (%instance-ref self 0)))
+	       (if (instancep new) (setq self new)
+		   (return self))))))
+
+  (defmacro instance-descriptor (instance)
+    "Follows 'forwarding pointers'."
+    `(%instance-ref (get-self ,instance) 0))
+  
+  (defmacro slot-unbound-p (instance slot)
+    "Follows 'forwarding pointers'."
+    `(let ((thing (instance-ref ,instance ,slot)))
+       (eq 'unbound thing)))
+
+  (proclaim '(inline send))
+  (defun send (instance message &rest args)
+    (let* ((self (get-self instance))
+	   (id (%instance-ref self 0))
+	   (send-fn (aref id 0)))
+      (apply send-fn instance message args))))
+
+
+

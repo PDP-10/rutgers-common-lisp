@@ -1,0 +1,32 @@
+(require 'flavors)
+
+(defconstant *speed-of-light* 300000)
+
+(defflavor moving-object
+  (x-position y-position x-velocity y-velocity mass)
+  ()
+  :gettable-instance-variables
+  :settable-instance-variables)
+
+(defmethod (moving-object :speed) ()
+  (sqrt (+ (expt x-velocity 2)
+	   (expt y-velocity 2))))
+
+(defmethod (moving-object :direction) ()
+  (atan y-velocity x-velocity))
+
+
+(defflavor relativity-mixin () ()
+  (:required-flavors moving-object))
+
+(defmethod (relativity-mixin :mass) ()
+  (/ mass (sqrt (- 1 (expt (/ (funcall-self :speed)
+			      *speed-of-light*)
+			   2)))))
+
+(defflavor ship
+  (name engine-speed)
+  (moving-object relativity-mixin)
+  :initable-instance-variables
+  :settable-instance-variables
+  :gettable-instance-variables)

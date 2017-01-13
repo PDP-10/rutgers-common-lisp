@@ -1,0 +1,68 @@
+;;; -*- Mode: lisp; Package: system -*-
+;;;
+;;; The kernel-kernel allows object-oriented systems to share hooks.
+;;; Written by Steven Handerson.
+;;;
+
+(in-package "SYSTEM")
+
+(export '(send alloc-instance get-self %instance-ref instance-ref iv-unbound-p))
+
+(eval-when (compile eval load)
+  (defstruct (instance (:print-function internal-print-instance)
+		       (:constructor internal-make-instance (descriptor vector))
+		       (:predicate instancep))
+  descriptor
+  vector)
+
+  (defun internal-print-instance (instance stream depth)
+    (cond ((get-handler :print-self instance)
+	   (send instance :print-self stream depth))
+	  (t (format stream "#<Random Instance ~S>"
+		     (%primitive make-immediate-type instance 16)))))
+
+  (defmacro alloc-instance (size id (initial-element 'unbound))
+    "(size instance-descriptor [initial-element])
+    Allocates a new instance thingy."
+    `(internal-make-instance
+      ,id (make-array ,size :initial-element ,initial-element)))
+
+  (defmacro %instance-ref (instance slot)
+    "Doesn't follow 'forwarding pointers'."
+    `(aref (%instance-vector ,instance) ,slot))
+
+  (defmacro instance-ref (instance slot)
+    "Follows 'forwarding pointers'."
+    `(aref (%instance-vector (get-self ,instance)) (1+ ,slot))))
+
+
+
+
+
+(eval-when (compile eval load)
+
+  (defmacro get-self (instance)
+    "(instance)
+    Follows 'forwarding pointers' to get the REAL instance."
+    `(let* ((self ,instance))
+       (loop (let ((new (%instance-ref self 0)))
+	       (if (instancep new) (setq self new)
+		   (return self))))))
+  
+  (defmacro instance-descriptor (instance)
+    "(instance)
+    Follows 'forwarding pointers'."
+    `(%instance-ref (get-self ,instance) 0))
+
+  (defmacro iv-unbound-p (instance slot)
+    "(instance slot)
+    Follows 'forwarding pointers'."
+    `(let ((thing (instance-ref ,instance ,slot)))
+       (eq 'unbound thing))))
+
+(proclaim '(inline send))
+(defun send (instance message &rest args)
+  (let* ((self (get-self instance))
+	 (id (%instance-ref self 0))
+	 (send-fn (aref id 0)))
+    (apply send-fn instance message args)))

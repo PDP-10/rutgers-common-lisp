@@ -1,0 +1,365 @@
+;;; -*- Mode: Lisp; Package: flavors -*-
+;;;
+;;; **********************************************************************
+;;; This code was written as part of the Spice Lisp project at
+;;; Carnegie-Mellon University, and has been placed in the public domain.
+;;; If you want to use this code or any part of Spice Lisp, please contact
+;;; Scott Fahlman (FAHLMAN@CMUC). 
+;;; **********************************************************************
+;;;
+;;; Huge file for Flavors release.
+;;;
+;;; Symbol macros are used to implement instance variables.
+;;; Written by Steven Handerson.
+
+;;;
+;;; Changing defflavor environment no longer works.
+;;;
+
+
+(in-package 'lisp)
+(export '(symbol-macro-let))
+
+#-lisp::symmac
+(eval-when (compile eval load) ; Eval-when-1
+
+;;; Symbol macros are akin to labels or macrolet; the code for a replacement is 
+;;; in the same environment that the original symbol was in (including the symbol
+;;; macros).  This is mostly because it's easier to implement.
+;;;
+;;; Newer version to deal with environments correctly.
+;;; Since there's no way to tell a macro with &environment in its arglist
+;;; from other macros, we must always maintain the lisp system's view of 
+;;; the environment.  We can do this in a clumsy way by having the
+;;; symbol-macro-let macro return somthing containing an internal macro
+;;; that gets the environment where it appears and then deals with its body
+;;; using that information.
+;;;
+
+(defvar *symbol-macro-environment* nil
+  "Used to pass the expansion environment to the transforms.")
+
+(defvar *symbol-macro-replacements* nil
+  "Holds symbol-macro-let replacements during macroexpansion.")
+
+(proclaim '(inline symbol-replaced-p))
+(Defun  symbol-replaced-p (symbol)
+  (assoc symbol *symbol-macro-replacements*))
+
+(proclaim '(inline symbol-replacement))
+(Defun symbol-replacement (replaced-p)
+  (cdr replaced-p))
+
+
+;;; Binding functions.
+
+(defun bind-symbol-macro (symbol expansion)
+  (push (cons symbol expansion) *symbol-macro-replacements*))
+
+(defmacro bind-non-macros (list &body forms)
+  `(let ((*symbol-macro-replacements*
+	  (remove-if #'(lambda (x) (member x ,list))
+		     *symbol-macro-replacements*
+		     :key #'car)))
+     ,@forms))
+
+(defmacro bind-non-macro (var &body forms)
+  `(let ((*symbol-macro-replacements*
+	  (remove ,var *symbol-macro-replacements* :key #'car)))
+     ,@forms))
+
+
+;;;
+;;; The macro itself.
+;;;
+
+(defmacro symbol-macro-let (bindings &body body
+				     &environment *symbol-macro-environment*)
+  (let ((*symbol-macro-replacements* *symbol-macro-replacements*))
+    (dolist (binding bindings)
+      (bind-symbol-macro (car binding) (cadr binding)))
+    `(progn ,@(mapcar #'symmac-replace body))))
+
+
+;;; 
+;;; Replacement functions.
+;;;
+
+;;; Macros and "symbol macros" get expanded, and the cycle repeats.
+;;; Normal functions just get their arguments replaced on.
+;;; Lambda calls get their bodies replaced as well as their args.
+;;; Special forms have their own random ways of getting replaced on,
+;;;  stored on their 'sym-mac-transform property.
+;;;
+
+(defun symmac-replace (form)
+  (prog (temp)
+    loop
+    (cond ((and (symbolp form)
+		(setq temp (symbol-replaced-p form)))
+	   (setq form (symbol-replacement temp))
+	   (go loop))
+	  ((atom form) (return form))
+	  ((not (symbolp (car form)))
+	   (let ((lambda (car form))
+		 (args (cdr form)))
+	     (or (and (listp lambda) (eq (car lambda) 'lambda))
+	       (error "Illegal function object: ~A" lambda))
+	     (return `((lambda ,@(replace-lambda (cadr lambda) (cddr lambda)))
+		       ,@(mapcar #'symmac-replace args)))))
+	  ((setq temp (get (car form) 'sym-mac-transform))
+	   (return (funcall temp form)))
+	  ((progn (multiple-value-setq (form temp)
+		    (macroexpand form *symbol-macro-environment*))
+		  temp)
+	   (go loop))
+	  ((special-form-p (car form))
+	   (error "Symbol-macro-let internal error: untransformed special~
+		  form ~A." (car form)))
+	  (t (return (cons (car form)
+			   (mapcar #'(lambda (form) (symmac-replace form))
+				   (cdr form))))))))
+
+
+;;; Takes a lambda-list and a list of forms to replace in that environment.
+;;; Returns a list of the new arglist and forms.
+
+(Defun replace-lambda (lambda-list forms)
+  (macrolet ((symmac-lambda-bind-var
+	      (var) `(setq *symbol-macro-replacements*
+			   (delete ,var *symbol-macro-replacements*
+				   :key #'car))))
+    (do* ((*symbol-macro-replacements* (copy-list *symbol-macro-replacements*))
+	  (list lambda-list (Cdr list))
+	  (search '(&optional &rest &key &allow-other-keys &aux))
+	  (temp nil)
+	  (newlist nil))
+	 ((endp list)
+	  (cons (nreverse newlist) (mapcar #'symmac-replace forms)))
+      (let ((car (car list)))
+	(cond ((setq temp (member car search))
+	       (setq search (cdr temp))
+	       (push car newlist))
+	      (t (case (car search)
+		   ;; This is for the normal vars.
+		   (&optional (symmac-lambda-bind-var car)
+			      (push car newlist))
+		   ;; This next clause is for the optionals.  Etc.
+		   (&rest (cond ((symbolp car)
+				 (symmac-lambda-bind-var car)
+				 (push car newlist))
+				(T (cond ((null (cdr car))
+					  (push car newlist))
+					 (t (push `(,(car car)
+						    ,(symmac-replace
+						      (cadr car))
+						    ,@(cddr car))
+						  newlist)
+					    (if (not (null (cddr car)))
+						(symmac-lambda-bind-var
+						 (caddr car)))))
+				   (symmac-lambda-bind-var (car car))))) 
+		   (&key (symmac-lambda-bind-var car)
+			 (push car newlist))
+		   (&allow-other-keys
+		    (cond ((symbolp car)
+			   (symmac-lambda-bind-var car)
+			   (push car newlist))
+			  (t (if (not (null (nth 1 car)))
+				 (push `(,(Car car)
+					 ,(symmac-replace (cadr car))
+					 ,(caddr car))
+				       newlist)
+				 (push car newlist))
+			     (if (not (null (nth 2 car)))
+				 (symmac-lambda-bind-var (nth 2 car)))
+			     (if (listp (car car))
+				 (symmac-lambda-bind-var (cadar car))))))
+		   (&aux (error "~A in lambda-list after &allow-other-keys."
+				car))
+		   (nil (cond ((symbolp car)
+			       (symmac-lambda-bind-var car)
+			       (push car newlist))
+			      (t (push `(,(car car)
+					 ,(symmac-replace (cadr car)))
+				       newlist)
+				 (symmac-lambda-bind-var (Car car)))))
+		   )))))))
+
+
+;;;
+;;; The transforms.
+;;;
+
+;;; Can take a raw function, which gets applied to the form to be transformed.
+;;; If it changes the environment, it should bind *symbol-macro-replacements*.
+
+(defmacro defsymtrans (special-form args-or-function &body body)
+  `(setf (get ',special-form 'sym-mac-transform)
+	 ,(if body
+	      `#'(lambda ,args-or-function
+		   (let ((*symbol-macro-replacements*
+			  *symbol-macro-replacements*))
+		     ,@body))
+	      args-or-function)))
+
+(defun symmac-leave-first-arg (Form)
+  (list* (car form) (cadr form)
+	 (mapcar #'symmac-replace (cddr form))))
+
+(defun symmac-progn-like (form)
+  (cons (car form) (mapcar #'symmac-replace (cdr form))))
+
+(defsymtrans quote #'identity)
+(defsymtrans go #'identity)
+(defsymtrans declare #'identity)
+
+(defsymtrans eval-when #'symmac-leave-first-arg)
+(defsymtrans block #'symmac-leave-first-arg)
+(defsymtrans return-from #'symmac-leave-first-arg)
+(defsymtrans the #'symmac-leave-first-arg)
+(defsymtrans %primitive #'symmac-leave-first-arg)
+
+(Defsymtrans return #'symmac-progn-like)
+(defsymtrans and #'symmac-progn-like)
+(defsymtrans or #'symmac-progn-like)
+(defsymtrans multiple-value-call #'symmac-progn-like)
+(defsymtrans multiple-value-prog1 #'symmac-progn-like)
+(defsymtrans unwind-protect #'symmac-progn-like)
+(defsymtrans progn #'symmac-progn-like)
+(defsymtrans prog1 #'symmac-progn-like)
+(DEfsymtrans prog2 #'symmac-progn-like)
+(defsymtrans if #'symmac-progn-like)
+(defsymtrans progv #'symmac-progn-like)
+(defsymtrans catch #'symmac-progn-like)
+(defsymtrans throw #'symmac-progn-like)
+
+
+(defsymtrans function (form)
+  (let ((lambdap (cadr form)))
+    (cond ((symbolp lambdap) form)
+	  ((atom lambdap) (error "Illegal arg to FUNCTION - ~A." lambdap))
+	  ((eq 'lambda (car lambdap))
+	   `#'(lambda ,@(replace-lambda (cadr lambdap) (cddr lambdap))))
+	  (t (error "Symmac - strange thing in FUNCTION.")))))
+
+(defsymtrans tagbody (form)
+  (do ((forms (cdr form) (cdr forms))
+       (newforms nil))
+      ((null forms) (cons 'tagbody (nreverse newforms)))
+    (if (symbolp (Car forms))
+	(push (car forms) newforms)
+	(push (symmac-replace (car forms)) newforms))))
+
+(defsymtrans setq (form)
+  (cons 'setf (mapcar #'symmac-replace (cdr form))))
+
+(defsymtrans let (form)
+  (let ((bound nil))
+    `(let ,(mapcar
+	    #'(lambda (binding)
+		(cond ((atom binding)
+		       (push binding bound)
+		       binding)
+		      (t (push (car binding) bound)
+			 `(,(car binding) ,(symmac-replace (Cadr binding))))))
+	    (cadr form))
+       ,@(bind-non-macros bound
+			  (mapcar #'symmac-replace (cddr form))))))
+
+
+(defsymtrans prog (Form)
+  `(let ,(cadr form)
+     (prog nil
+       ,@(mapcar #'(lambda (f) (if (symbolp f) f (symmac-replace f)))
+		 (cddr form)))))
+
+
+(defsymtrans prog* (Form)
+  `(let* ,(cadr form)
+     (prog* ()
+       ,@(mapcar #'(lambda (f) (if (symbolp f) f (symmac-replace f)))
+		 (cddr form)))))
+
+(defsymtrans let* (form)
+  `(let* ,(mapcar
+	   #'(lambda (binding)
+	       (cond ((atom binding)
+		      (setq *symbol-macro-replacements*
+			    (delete binding *symbol-macro-replacements*
+				    :key #'car))
+		      binding)
+		     (t (prog1 `(,(car binding) ,(symmac-replace (cadr binding)))
+			       (setq *symbol-macro-replacements*
+				     (delete (Car binding)
+					     *symbol-macro-replacements*
+					     :key #'car))))))
+	   (cadr form))
+     ,@(mapcar #'symmac-replace (cddr form))))
+
+(defsymtrans cond (form)
+  `(cond ,@(mapcar #'(lambda (clause)
+		       (mapcar #'symmac-replace clause))
+		   (cdr form))))
+
+(defsymtrans defun (form)
+  (let ((name (cadr form))
+	(args (caddr form))
+	(body (cdddr form)))
+    `(defun ,name ,@(replace-lambda args body))))
+
+(defsymtrans multiple-value-bind (form)
+  (let ((bindings (cadr form))
+	(values (caddr form))
+	(forms (cdddr form)))
+    `(multiple-value-bind ,bindings ,(symmac-replace values)
+       ,@(bind-non-macros bindings
+			  (mapcar #'symmac-replace forms)))))
+
+(defsymtrans multiple-value-setq (form)
+  (pop form)
+  (let* ((vars (pop form))
+	 (values (pop form))
+	 (pairs nil)
+	 (gens (mapcar #'(lambda (var)
+			   (let ((gen (gensym)))
+			     (push gen pairs)
+			     (push var pairs)
+			     gen))
+		       vars)))
+    `(multiple-value-bind ,gens ,(symmac-replace values)
+       ,(symmac-replace `(setf ,@pairs)))))
+
+
+(defsymtrans compiler-let (form)
+  `(compiler-let ,(cadr form)
+     (symmac-internal ,*symbol-macro-replacements* ,@(cddr form))))
+
+(defsymtrans flet (form)
+  `(flet ,(cadr form)
+     (symmac-internal ,*symbol-macro-replacements* ,@(cddr form))))
+
+(defsymtrans macrolet (form)
+  `(macrolet ,(cadr form)
+     (symmac-internal ,*symbol-macro-replacements* ,@(cddr form))))
+
+;;; This is complicated, but I think it works.  A labels gets expanded into
+;;; a labels inside a duplicate labels.  The first is just to shadow
+;;; any macros for the benefit of constructing the environment.  The inner
+;;; is the one that's functional, whose label bodies must be replaced for
+;;; symbol macros.
+
+(defsymtrans labels (form)
+  `(labels ,(cadr form)
+     (symmac-internal ,*symbol-macro-replacements*
+		      (symmac-labels ,@(cdr form)))))
+
+(defsymtrans symmac-labels (form)
+  `(labels ,(mapcar #'(lambda (binding)
+			`(,(car binding)
+			  ,@(replace-lambda (cadr binding) (cddr binding))))
+		    (cadr form))
+     ,@(mapcar #'symmac-replace (cddr form))))
+
+) ; Eval-when-1
+

@@ -1,0 +1,13 @@
+(defflavor jordg
+  (foo bar)
+  ()
+  :gettable-instance-variables
+  :initable-instance-variables
+  :settable-instance-variables
+)
+
+(defmethod (jordg :list) ()
+  (list foo bar))
+
+(defmethod (jordg :cons) ()
+  (cons (send self :foo) (send self :bar)))

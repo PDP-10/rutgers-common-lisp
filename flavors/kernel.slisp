@@ -1,0 +1,503 @@
+;;; KERNEL.SLISP
+;;; The Flavors kernel hides the implementation of instance variables.
+;;;
+;;; Change: remap by name of the message.
+;;; Microcode should pass all values inline.
+;;; Someday: make rehash better (make id's internal hashtables).
+;;; Keep entry vectors, I guess.  Pass things as args and pass the 
+;;; vector too, and decache if it changes.
+;;; Make cyclical hastables of 1 thing for microcode.
+;;;
+;;; What if you do a set-handler and a submethod isn't defined?
+
+(in-package "FLAVOR-INTERNALS" :use '("LISP" "SYSTEM") :nicknames '("FI"))
+
+(export '(pointer-to-fixnum
+
+	  iv-env
+	  make-iv-env
+	  iv-env-vector
+
+	  make-instance-descriptor
+	  instance-descriptor-env
+	  instance-descriptor-type
+	  instance-descriptor-default-handler
+	  instance-descriptor-instantiated-p
+	  handle-message
+	  unhandle-message
+	  do-handlers
+	  get-handler
+	  get-message
+	  instantiate-instance-descriptor
+	  resize-instances 
+	  freeze-instances
+	  unfreeze-instances
+
+	  defun-default-handler
+	  internal-define-method
+	  method-apply
+	  method-call
+	  define-set-method
+	  define-get-method
+	  method-defined-p
+	  method-called-methods
+
+	  send
+	  alloc-instance
+	  get-self
+	  %instance-ref
+	  instance-ref
+	  slot-unbound-p
+	  iv-bound-p
+	  instancep
+	  self
+	  instance-descriptor
+	  do-instance-resizing
+	  ))
+
+(eval-when (compile eval load) ; Eval-when-2
+
+;;;
+;;; Random stuff and Environments.
+;;;
+
+
+;;; Takes a list of forms and returns values of a list of doc-strings
+;;; and declares, and a list of the remaining forms.
+
+(eval-when (compile eval load)
+  (defun extract-doc-and-declares (forms)
+    (do ((forms forms (cdr forms))
+	 (docs nil (cons (car forms) docs)))
+	((or (endp forms)
+	     (and (not (stringp (car forms)))
+		  (not (and (listp (car forms))
+			    (eq (caar forms) 'declare)))))
+	 (values (nreverse docs) forms))))
+
+  (defmacro self-and-descriptor (instance)
+    `(let ((inst (get-self ,instance)))
+       (values inst (%instance-ref inst 0)))))
+
+(defun private-structure-printer (object stream depth)
+  (Declare (ignore depth))
+  (format stream "#<~A ~A>" (type-of object) (pointer-to-fixnum object)))
+
+;;;
+;;; Environments.
+;;;
+
+(Defstruct (iv-env (:print-function private-structure-printer)
+		   (:constructor make-iv-env (vector)))
+  (vector nil :read-only t)
+  (bindings* t))
+
+(defun iv-env-bindings (env)
+  (let ((bin (iv-env-bindings* env)))
+    (cond ((listp bin) bin)
+	  (t (setf (iv-env-bindings* env)
+		   (let ((vec (iv-env-vector env))
+			 (res nil))
+		     (dotimes (i (length vec))
+		       (push `(,(Aref vec i) (iv ,(aref vec i))) res))
+		     res))))))
+
+
+;;;
+;;; Defstructs
+;;;
+
+(Defstruct (instance-descriptor (:type vector)
+				(:constructor internal-make-id
+					      (type env default-entry)))
+  (send-fn 'flavor-send)
+  type
+  (table (make-hash-table :size 30 :test #'eq))
+  default-entry
+  (instantiated-p nil)
+  (env nil :read-only t))
+
+(defun make-instance-descriptor (type env default-handler)
+  (internal-make-id type env (make-entry :function default-handler)))
+
+(Defstruct (entry (:type vector))
+  function
+  map
+  cmap)
+
+
+(Defstruct (method (:print-function private-structure-printer)
+		   (:predicate methodp)
+		   (:constructor make-method (fn-name calls ivs current-symbol)))
+  fn-name
+  calls          ; List in reverse order.
+  ivs            ; Vector of variable names or NIL.
+  current-symbol)
+
+(defun method-called-methods (method)
+  (method-calls (symbol-value method)))
+
+(defun method-defined-p (method-fn-name)
+  (methodp (symbol-value method-fn-name)))
+
+;;;
+;;; Instance Descriptors.
+;;;
+
+(defmacro funcall-entry (self message entry &rest args)
+  `(funcall (entry-function ,entry) ,self ,message ,entry ,@args))
+
+(defmacro apply-entry (self message entry &rest args)
+  `(apply (entry-function ,entry) ,self ,message ,entry ,@args))
+
+(eval-when (compile eval load)
+  (defmacro get-message ()
+    "Used in the body of a default handler, returns the message
+    that invoked this handler."
+    '%message)
+  (defsetf get-message () (new)
+    (declare (ignore new))
+    (error "Cannot setf get-message.")))
+
+(eval-when (compile eval load)
+  (Defmacro defun-default-handler (name Args &body body)
+    "Twiddles args so the function can be called as a default handler.
+    Also makes (get-message) work in the body."
+    (multiple-value-bind (docs forms) (extract-doc-and-declares body)
+      `(defun ,name (self %message %entry ,@args)
+	 ,@docs
+	 self %message %entry
+	 (progn ,@forms)))))
+
+(defun flavor-send (instance message &rest args)
+  (multiple-value-bind (self id) (self-and-descriptor instance)
+    (let* ((table (instance-descriptor-table id)))
+      (unless (hash-table-p table)
+	(do-instance-resizing instance)
+	(multiple-value-setq (self id) (self-and-descriptor instance))
+	(setq table (instance-descriptor-table id))
+	(unless (hash-table-p table)
+	  (error "Internal error: resizing #<Random Instance ~S> didn't work."
+		 (pointer-to-fixnum instance))))
+      (let ((entry (gethash
+		    message table
+		    (instance-descriptor-default-entry id))))
+	(apply-entry self message entry args)))))
+
+
+(defun handle-message (message instance-descriptor method)
+  "The method must be defined before it can be a handler.
+  (via internal-define-method or define-set-method or define-get-method)."
+  (let ((table (instance-descriptor-table instance-descriptor)))
+    (unless (null table)
+      (let ((entry (make-entry :function method)))
+	(do-map-method instance-descriptor entry)
+	(setf (gethash message (instance-descriptor-table instance-descriptor))
+	      entry))))
+  method)
+
+(Defun unhandle-message (message instance-descriptor)
+  "Makes the given message unhandled."
+  (let ((table (instance-descriptor-table instance-descriptor)))
+    (unless (null table)
+      (remhash message table))))
+
+(defun get-handler (message inst-or-desc)
+  "Returns the method-function-name of the method that handles message
+  for instance or instance-descriptor inst-or-desc."
+  (let (table)
+    (cond
+     ((instancep inst-or-desc)
+      (multiple-value-bind (self id) (self-and-descriptor inst-or-desc)
+	(setq table (instance-descriptor-table id))
+	(unless (hash-table-p table)
+	  (do-instance-resizing self)
+	  (multiple-value-setq (self id) (self-and-descriptor self))
+	  (setq table (instance-descriptor-table id))
+	  (unless (hash-table-p table)
+	    (error "Internal error: resizing #<Random Instance ~S> didn't work."
+		   (pointer-to-fixnum inst-or-desc))))))
+     (t (setq table (instance-descriptor-table inst-or-desc))))
+    (let ((entry (gethash message table)))
+      (if entry (method-fn-name (symbol-value (entry-function entry)))))))
+
+
+;;;
+;;; Other instance-descriptor stuff.
+;;;
+
+
+(defmacro do-handlers (((name function) instance-descriptor) &body body)
+  "(((message method-fn-name) instance-descriptor) . body)
+  Does the body for each handler, with message and method-fn-name bound to
+  each successive handler binding."
+  `(block nil
+     (let ((table (instance-descriptor-table ,instance-descriptor)))
+       (unless (null table)
+	 (maphash #'(lambda (,name entry)
+		      (let ((,function
+			     (method-fn-name
+			      (symbol-value (entry-function entry)))))
+			,@body))
+		  table)))))
+
+(defun instantiate-instance-descriptor (instance-descriptor)
+  "Returns the new instance, all ivs set to unbound."
+  (let* ((len (length (iv-env-vector
+		       (instance-descriptor-env instance-descriptor))))
+	 (new (alloc-instance len instance-descriptor)))
+    (setf (instance-descriptor-instantiated-p instance-descriptor) t)
+    new))
+
+(defun resize-instances (instance-descriptor new-descriptor function)
+  "Basically just changes the instance to be of a new instance-descriptor.
+  Those slots not present in the previous descriptor get set to unbound.
+  The function, which probably doesn't get called immediately, should
+  (when it IS called) try to set the unbound variables to some reasonable
+  value."
+  (setf (instance-descriptor-instantiated-p new-descriptor)
+	(instance-descriptor-instantiated-p instance-descriptor)
+	(instance-descriptor-table instance-descriptor)
+	(cons new-descriptor function)))
+
+(defun do-instance-resizing (instance)
+  (multiple-value-bind (inner id) (self-and-descriptor instance)
+    (let* ((new-id (car (instance-descriptor-table id)))
+	   (fn (cdr (instance-descriptor-table id)))
+	   (old-env (instance-descriptor-env id))
+	   (new-env (instance-descriptor-env new-id))
+	   (old-vec (iv-env-vector old-env))
+	   (new-vec (iv-env-vector new-env)))
+      (let ((new (alloc-instance (length new-vec) new-id)))
+	(dotimes (i (length new-vec))
+	  (let* ((iv (aref new-vec i))
+		 (old-pos (position iv old-vec)))
+	    (if old-pos
+		(setf (%instance-ref new (1+ i))
+		      (%instance-ref inner (1+ old-pos))))))
+	(setf (%instance-ref instance 0) new)
+	(funcall fn new)
+	new))))
+
+
+(defun freeze-entry (id entry)
+  (When (eq (symbol-function (entry-function entry)) #'non-method)
+    (do-map-method id entry))
+  (let* ((sym (entry-function entry))
+	 (new (make-symbol (symbol-name sym))))
+    (setf (symbol-function new) (symbol-function sym)
+	  (symbol-value new) (symbol-value sym)
+	  (entry-function entry) new))
+  (let ((cmap (entry-cmap entry)))
+    (dotimes (i (length cmap))
+      (setf (aref cmap i) (freeze-entry id (aref cmap i))))))
+
+(defun freeze-instances (instance-descriptor)
+  "Makes the instances of this instance-descriptor deaf to changes in 
+  method definition.  Use unfreeze-instance to wake it up again."
+  (maphash #'(lambda (mess entry)
+	       (declare (ignore mess))
+	       (freeze-entry instance-descriptor entry))
+	   (instance-descriptor-table instance-descriptor)))
+
+(defun unfreeze-instances (instance-descriptor)
+  "Undoes freeze-instances."
+  (declare (special instance-descriptor))
+  (maphash #'(lambda (mess entry)
+	       (declare (ignore mess))
+	       (do-map-method instance-descriptor entry))
+	   (instance-descriptor-table instance-descriptor)))
+
+;;;
+;;; Methods.
+;;;
+
+
+(defun-default-handler non-method (&rest args)
+  (multiple-value-bind (inner-self id) (self-and-descriptor self)
+    (declare (ignore inner-self))
+    (let ((fn (entry-function %entry)))
+      (cond ((not (symbolp fn))
+	     (error "Internal bogusness: ~S handler for ~S frozen unmapped."
+		    (get-message) self))
+	    ((eq fn (method-current-symbol (symbol-value fn)))
+	     (error "Undefined method ~A." fn))
+	    (t (do-map-method id %entry)
+	       (apply-entry self (get-message) %entry args))))))
+
+
+(defmacro map-ivs (ivs instance-ivs)
+  `(let ((ivs ,ivs)
+	 (instance-ivs ,instance-ivs))
+     (let ((res (if ivs (make-array (length ivs)))))
+       (dotimes (i (length ivs))
+	 (let ((pos (position (aref ivs i) instance-ivs)))
+	   (setf (aref res i) (if pos (1+ pos)))))
+       res)))
+
+;;; When we first map in a method, we make the cmap a simple vector.
+;;; The first time we remap, we make it a fill-pointered adjustable vector and
+;;; thereafter adjust it to the appropriate size. @#@#
+
+(defun do-map-method (id entry)
+  (let* ((structure (symbol-value (entry-function entry)))
+	 (ivs (method-ivs structure))
+	 (called-methods (method-calls structure))
+	 (instance-ivs (iv-env-vector (instance-descriptor-env id))))
+    (let ((cmap (if called-methods (make-array (length called-methods))))
+	  (map (map-ivs ivs instance-ivs))
+	  (new-sym (method-current-symbol (symbol-value (entry-function entry)))))
+      (do ((i (1- (length called-methods)) (1- i))
+	   (m called-methods (cdr m)))
+	  ((null m))
+	(let ((entry (make-entry :function (car m))))
+	  (do-map-method id entry)
+	  (setf (Aref cmap i) entry)))
+      (setf (entry-cmap entry) cmap
+	    (entry-map entry) map
+	    (entry-function entry) new-sym))))
+
+
+
+
+(defun remap-method
+       (method-fn-name
+	&optional
+	(new-function-object
+	 (symbol-function (method-current-symbol (symbol-value method-fn-name)))))
+  (let* ((structure (symbol-value method-fn-name))
+	 (new-symbol (make-symbol (symbol-name method-fn-name)))
+	 (current (method-current-symbol structure)))
+    (setf (symbol-value new-symbol) (symbol-value current)
+	  (symbol-function new-symbol) new-function-object
+	  (symbol-function current) #'non-method
+	  (method-current-symbol structure) new-symbol)))
+
+
+
+(defun update-method (fn-name ivs called-methods)
+  (if (boundp fn-name)
+      (let ((structure (symbol-value fn-name)))
+	(if (and (equalp ivs (method-ivs structure))
+		 (equalp called-methods (method-calls structure)))
+	    ;; No remapping necessary.  Set the current to the new function.
+	    ;; If we're still on the original, we needn't do anything.
+	    (unless (eq fn-name (method-current-symbol structure))
+	      (setf (symbol-function (method-current-symbol structure))
+		    (symbol-function fn-name)
+		    (symbol-function fn-name) #'non-method))
+	    (progn (setf (method-ivs structure) ivs
+			 (method-calls structure) called-methods)
+		   (remap-method fn-name (symbol-function fn-name)))))
+      (let ((structure (make-method fn-name called-methods ivs fn-name)))
+	(setf (symbol-value fn-name) structure))))
+
+;;; When a method-call or method-apply expands, it sees if it finds the 
+;;; called method in the list of methods this method is known to call.
+;;; If so, it just references the corresponding slot
+;;; (the last element gets slot zero) of the other-mapping-table.
+;;; If not, it pushes the new method onto the front of the list,
+;;; updates cmap (currently by remapping everything - ugh)
+;;; and references the new slot.
+
+(defvar *calling-ivs* nil)
+(DEfvar *calling-method* nil)
+(DEfvar *called-methods* nil)
+
+;;; Compiled: sml expands, install-method gets correct values, 
+;;; %calling-method disappears.
+;;; Interpreted: %calling-method is part of env; specials are nil at
+;;; runtime / expansion time.
+;;;
+
+(defmacro internal-define-method (method-fn-name env args body)
+  "Method-fn-name is a method-function-name (i.e. a symbol nobody else knows about).
+  Env is an iv-environment. Args is the arglist.
+  Body is a list of forms.
+
+  Expands to a form that, when evaluated, defines a handler."
+  `(compiler-let ((*calling-method* ',method-fn-name)
+		  (*calling-ivs* ',(iv-env-vector env))
+		  (*called-methods* nil))
+     (symbol-macro-let ((%calling-method ',method-fn-name)
+			(%calling-ivs ',(iv-env-vector env))
+			,@(iv-env-bindings env))
+       (defun-default-handler ,method-fn-name ,args ,@body)
+       (install-method ,method-fn-name))))
+
+
+(defmacro iv (name)
+  (if *calling-method*
+      `(%instance-ref self (svref (entry-map %entry)
+				  ,(position name *calling-ivs*)))
+      `(%instance-ref self (svref (entry-map %entry)
+				  (position ',name %calling-ivs)))))
+
+(defmacro iv-bound-p (name)
+  (if *calling-method*
+      `(slot-unbound-p self (svref (entry-map %entry)
+				   ,(position name *calling-ivs*)))
+      `(slot-unbound-p self (svref (entry-map %entry)
+				   (position ',name %calling-ivs)))))
+
+(defmacro find-method (method)
+  (if *calling-method*
+      (compiler-find-method method)
+      `(interpreter-find-method ',method %calling-method self %entry)))
+
+(defun interpreter-find-method (method caller self %entry)
+  (do ((list (method-calls (symbol-value caller)) (cdr list))
+       (len 0 (1+ len)))
+      ((null list)
+       (remap-method caller)
+       (push method (method-calls (symbol-value caller)))
+       (do-map-method (instance-descriptor self) %entry)
+       len)
+    (if (eq (Car list) method)
+	(return (length (cdr list))))))
+
+(Defun compiler-find-method (method)
+  (do ((list *called-methods* (cdr list))
+       (len 0 (1+ len)))
+      ((null list)
+       (push method *called-methods*)
+       len)
+    (if (eq (Car list) method)
+	(return (length (cdr list))))))
+
+(defmacro install-method (method)
+  `(update-method ',method ',(or *calling-ivs* '#()) ',*called-methods*))
+
+
+(defmacro method-call (method . args)
+  "Macro used inside internal-define-method, analogous to funcall.
+  Call like (method-call method-fn-name arg1 arg2...)."
+  `(let* ((slot (find-method ,method))
+	  (entry (aref (entry-cmap %entry) slot)))
+     (funcall-entry self (get-message) entry ,@args)))
+
+(defmacro method-apply (method . args)
+  "Macro used inside internal-define-method, analogous to apply.
+  Call like (method-apply method-fn-name arg1 arg2)."
+  `(let* ((slot (find-method ,method))
+	  (entry (aref (entry-cmap %entry) slot)))
+     (apply-entry self (get-message) entry ,@args)))
+
+(defun define-set-method (method-fn-name var)
+  "Defines a method that sets the given variable name."
+  (let ((vec (make-array 1 :initial-element var)))
+    (defun-default-handler random-setter (new)
+      (setf (%instance-ref self (svref (entry-map %entry) 0)) new))
+    (setf (symbol-function method-fn-name) #'random-setter)
+    (update-method method-fn-name vec nil)))
+
+(defun define-get-method (method-fn-name var)
+  "Defines a method that returns the given named variable."
+  (let ((vec (make-array 1 :initial-element var)))
+    (defun-default-handler random-getter ()
+      (%instance-ref self (svref (entry-map %entry) 0)))
+    (setf (symbol-function method-fn-name) #'random-getter)
+    (update-method method-fn-name vec nil)))
+
+
+) ; Eval-when-2

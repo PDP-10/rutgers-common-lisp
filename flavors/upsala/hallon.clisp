@@ -1,0 +1,23 @@
+(in-package 'flavors)
+
+(defflavor hallon
+  (foo bar)
+  ()
+  :initable-instance-variables
+  :settable-instance-variables)
+
+(defmethod (hallon :list) ()
+  (list foo bar))
+
+(defmethod (hallon :foo-set) (new-foo)
+  (setq foo new-foo))
+
+(defmethod (hallon :bar-set) (new-bar)
+  (setq bar new-bar))
+
+(defmethod (hallon :foo?) ()
+  foo)
+
+(defmethod (hallon :bar?) ()
+  bar)
+
